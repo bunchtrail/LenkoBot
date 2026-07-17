@@ -1,0 +1,156 @@
+import sqlite3
+
+import pytest
+
+from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
+from lenkobot.personas import Persona, PersonaCatalog
+from lenkobot.sqlite_schema import (
+    CURRENT_SCHEMA_VERSION,
+    SchemaVersionError,
+    open_state_database,
+)
+from lenkobot.telegram_router import IncomingTelegramMessage, SQLiteConversationStore
+
+
+def catalog():
+    return PersonaCatalog(
+        (
+            Persona(
+                key="companion",
+                display_name="Companion",
+                identity_prompt="A calm companion.",
+                identity_version=1,
+            ),
+        ),
+        default_persona_key="companion",
+    )
+
+
+def test_unversioned_state_database_is_migrated_without_losing_session_data(tmp_path):
+    database_path = tmp_path / "state.db"
+    legacy = sqlite3.connect(database_path)
+    legacy.executescript(
+        """
+        CREATE TABLE conversation (
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            active_persona_key TEXT NOT NULL,
+            UNIQUE(platform, chat_id)
+        );
+        CREATE TABLE persona_session (
+            id INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversation(id),
+            persona_key TEXT NOT NULL,
+            identity_version INTEGER NOT NULL,
+            UNIQUE(conversation_id, persona_key, identity_version)
+        );
+        INSERT INTO conversation (id, platform, chat_id, active_persona_key)
+        VALUES (7, 'telegram', 500, 'companion');
+        INSERT INTO persona_session (
+            id, conversation_id, persona_key, identity_version
+        ) VALUES (11, 7, 'companion', 1);
+        """
+    )
+    legacy.close()
+
+    conversation_store = SQLiteConversationStore(database_path)
+    turn = conversation_store.route_message(
+        IncomingTelegramMessage(
+            user_id=42,
+            chat_id=500,
+            chat_type="private",
+            text="hello",
+        ),
+        catalog(),
+    )
+    conversation_store.close()
+    memory_store = SQLiteMemoryStore(database_path)
+    persona_id = memory_store.register_persona(catalog().get("companion"))
+    record = memory_store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.SHARED,
+            kind="fact",
+            content="kept",
+        )
+    )
+    memory_store.close()
+
+    connection = open_state_database(database_path)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    conversation = connection.execute(
+        "SELECT id, active_persona_key, version FROM conversation WHERE chat_id = 500"
+    ).fetchone()
+    connection.close()
+
+    assert turn.conversation_id == 7
+    assert turn.session_id == 11
+    assert persona_id > 0
+    assert record.content == "kept"
+    assert version == CURRENT_SCHEMA_VERSION
+    assert tuple(conversation) == (7, "companion", 1)
+
+
+def test_newer_schema_version_is_rejected_without_modifying_database(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    connection.execute("INSERT INTO marker (value) VALUES ('unchanged')")
+    connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION + 1}")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(SchemaVersionError):
+        open_state_database(database_path)
+
+    check = sqlite3.connect(database_path)
+    assert check.execute("SELECT value FROM marker").fetchone()[0] == "unchanged"
+    assert check.execute("PRAGMA user_version").fetchone()[0] == (
+        CURRENT_SCHEMA_VERSION + 1
+    )
+    check.close()
+
+
+def test_failed_migration_rolls_back_ddl_and_does_not_advance_version(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE conversation (
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            active_persona_key TEXT NOT NULL,
+            UNIQUE(platform, chat_id)
+        );
+        CREATE TABLE persona_session (
+            id INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversation(id),
+            persona_key TEXT NOT NULL,
+            identity_version INTEGER NOT NULL,
+            UNIQUE(conversation_id, persona_key, identity_version)
+        );
+        CREATE TABLE memory (id INTEGER PRIMARY KEY);
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        open_state_database(database_path)
+
+    check = sqlite3.connect(database_path)
+    tables = {
+        row[0]
+        for row in check.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    version = check.execute("PRAGMA user_version").fetchone()[0]
+    check.close()
+
+    assert version == 1
+    assert "memory" in tables
+    assert "persona" not in tables
+    assert "relationship" not in tables

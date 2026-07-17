@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 
 from .personas import Persona
+from .sqlite_schema import open_state_database
 
 
 class MemoryScope(StrEnum):
@@ -106,70 +107,7 @@ class SQLiteMemoryStore:
             raise ValueError("profile_id cannot be empty")
         self._profile_id = profile_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._connection = sqlite3.connect(database_path)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS persona (
-                id INTEGER PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                key TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                identity_prompt TEXT NOT NULL,
-                identity_version INTEGER NOT NULL CHECK(identity_version > 0),
-                status TEXT NOT NULL DEFAULT 'active'
-                    CHECK(status IN ('active', 'disabled')),
-                UNIQUE(profile_id, key)
-            );
-
-            CREATE TABLE IF NOT EXISTS relationship (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                persona_id INTEGER NOT NULL REFERENCES persona(id) ON DELETE CASCADE,
-                summary TEXT NOT NULL DEFAULT '',
-                state_json TEXT NOT NULL DEFAULT '{}'
-                    CHECK(json_valid(state_json)),
-                version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-                updated_at TEXT NOT NULL,
-                UNIQUE(user_id, persona_id),
-                UNIQUE(id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                scope TEXT NOT NULL
-                    CHECK(scope IN ('shared', 'persona_private', 'relationship')),
-                persona_id INTEGER REFERENCES persona(id) ON DELETE CASCADE,
-                relationship_id INTEGER,
-                kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
-                content TEXT NOT NULL CHECK(length(trim(content)) > 0),
-                provenance_session_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'active'
-                    CHECK(status IN ('active', 'deleted')),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (relationship_id, user_id)
-                    REFERENCES relationship(id, user_id) ON DELETE CASCADE,
-                CHECK(
-                    (scope = 'shared' AND persona_id IS NULL AND relationship_id IS NULL)
-                    OR
-                    (scope = 'persona_private' AND persona_id IS NOT NULL
-                        AND relationship_id IS NULL)
-                    OR
-                    (scope = 'relationship' AND persona_id IS NULL
-                        AND relationship_id IS NOT NULL)
-                )
-            );
-
-            CREATE INDEX IF NOT EXISTS memory_user_scope_persona_updated_idx
-                ON memory(user_id, scope, persona_id, updated_at DESC, id DESC);
-            CREATE INDEX IF NOT EXISTS memory_relationship_updated_idx
-                ON memory(relationship_id, updated_at DESC, id DESC);
-            """
-        )
+        self._connection = open_state_database(database_path)
 
     def register_persona(self, persona: Persona) -> int:
         with self._connection:

@@ -120,6 +120,17 @@ delivery_outbox(
 
 `conversation.version` используется для optimistic concurrency при одновременных Telegram updates. SQLite является canonical store; любой embedding/vector index можно пересобрать из него и не использовать как source of truth.
 
+## SQLite schema и concurrency
+
+`Confirmed`: DDL и migration order принадлежат одному `sqlite_schema` boundary. Conversation, memory и последующие stores получают настроенное соединение через него и не создают собственные таблицы.
+
+- Schema version хранится в `PRAGMA user_version`; migrations применяются последовательно и меняют version в той же transaction, что и DDL.
+- Существующие unversioned `state.db` мигрируются additively. Conversation, persona-session и memory identifiers сохраняются; key-based persona routing в этой vertical не заменяется на internal `persona.id`.
+- База с version новее поддерживаемой отклоняется fail-closed без DDL или записей. Ошибка migration откатывает текущую migration и не помечает её применённой.
+- Каждое store connection остаётся thread-bound, включает foreign keys и одинаковый bounded busy timeout. WAL, cross-process writer coordination и backup policy остаются отдельными решениями.
+- Успешные route и persona switch линейризуются через compare-and-swap по `conversation.version`. Version увеличивается на каждую такую операцию; CAS conflict повторяет всю операцию ограниченное число раз.
+- Persona session создаётся или выбирается в той же transaction, что и успешный CAS. Поэтому `RoutedTurn` всегда содержит lane той persona и identity version, которые были активны в точке линейризации.
+
 ## Компоненты MVP
 
 ```text

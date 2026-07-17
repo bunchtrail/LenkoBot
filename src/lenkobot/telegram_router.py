@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
-import sqlite3
 from typing import Protocol
 
 from .personas import Persona, PersonaCatalog
+from .sqlite_schema import open_state_database
 
 
 @dataclass(frozen=True)
@@ -30,111 +30,117 @@ class ReplyPort(Protocol):
 
 class SQLiteConversationStore:
     def __init__(self, database_path: Path) -> None:
-        self._connection = sqlite3.connect(database_path)
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS conversation (
-                id INTEGER PRIMARY KEY,
-                platform TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                active_persona_key TEXT NOT NULL,
-                UNIQUE(platform, chat_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS persona_session (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL REFERENCES conversation(id),
-                persona_key TEXT NOT NULL,
-                identity_version INTEGER NOT NULL,
-                UNIQUE(conversation_id, persona_key, identity_version)
-            );
-            """
-        )
+        self._connection = open_state_database(database_path)
 
     def route_message(
         self,
         message: IncomingTelegramMessage,
         persona_catalog: PersonaCatalog,
     ) -> RoutedTurn:
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO conversation (platform, chat_id, active_persona_key)
-                VALUES ('telegram', ?, ?)
-                """,
-                (message.chat_id, persona_catalog.default_persona_key),
-            )
+        self._ensure_conversation(message.chat_id, persona_catalog.default_persona_key)
+        for _ in range(8):
             conversation = self._connection.execute(
                 """
-                SELECT id, active_persona_key
+                SELECT id, active_persona_key, version
                 FROM conversation
                 WHERE platform = 'telegram' AND chat_id = ?
                 """,
                 (message.chat_id,),
             ).fetchone()
-            conversation_id, persona_key = conversation
+            conversation_id = int(conversation["id"])
+            persona_key = str(conversation["active_persona_key"])
+            version = int(conversation["version"])
             persona = persona_catalog.get(persona_key)
             if persona is None:
                 raise ValueError("active persona is not present in catalog")
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO persona_session
-                    (conversation_id, persona_key, identity_version)
-                VALUES (?, ?, ?)
-                """,
-                (conversation_id, persona_key, persona.identity_version),
-            )
-            session = self._connection.execute(
-                """
-                SELECT id
-                FROM persona_session
-                WHERE conversation_id = ? AND persona_key = ? AND identity_version = ?
-                """,
-                (conversation_id, persona_key, persona.identity_version),
-            ).fetchone()
+            try:
+                with self._connection:
+                    updated = self._connection.execute(
+                        """
+                        UPDATE conversation
+                        SET version = version + 1
+                        WHERE id = ? AND version = ?
+                        """,
+                        (conversation_id, version),
+                    )
+                    if updated.rowcount != 1:
+                        raise _ConversationVersionConflict
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO persona_session
+                            (conversation_id, persona_key, identity_version)
+                        VALUES (?, ?, ?)
+                        """,
+                        (conversation_id, persona_key, persona.identity_version),
+                    )
+                    session = self._connection.execute(
+                        """
+                        SELECT id
+                        FROM persona_session
+                        WHERE conversation_id = ? AND persona_key = ?
+                            AND identity_version = ?
+                        """,
+                        (conversation_id, persona_key, persona.identity_version),
+                    ).fetchone()
+            except _ConversationVersionConflict:
+                continue
 
-        return RoutedTurn(
-            conversation_id=conversation_id,
-            chat_id=message.chat_id,
-            persona_key=persona_key,
-            session_id=session[0],
-            identity_version=persona.identity_version,
-            text=message.text,
-        )
+            return RoutedTurn(
+                conversation_id=conversation_id,
+                chat_id=message.chat_id,
+                persona_key=persona_key,
+                session_id=int(session["id"]),
+                identity_version=persona.identity_version,
+                text=message.text,
+            )
+        raise RuntimeError("conversation changed too frequently")
 
     def switch_persona(self, chat_id: int, persona: Persona) -> None:
+        self._ensure_conversation(chat_id, persona.key)
+        for _ in range(8):
+            conversation = self._connection.execute(
+                """
+                SELECT id, version
+                FROM conversation
+                WHERE platform = 'telegram' AND chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+            conversation_id = int(conversation["id"])
+            version = int(conversation["version"])
+            try:
+                with self._connection:
+                    updated = self._connection.execute(
+                        """
+                        UPDATE conversation
+                        SET active_persona_key = ?, version = version + 1
+                        WHERE id = ? AND version = ?
+                        """,
+                        (persona.key, conversation_id, version),
+                    )
+                    if updated.rowcount != 1:
+                        raise _ConversationVersionConflict
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO persona_session
+                            (conversation_id, persona_key, identity_version)
+                        VALUES (?, ?, ?)
+                        """,
+                        (conversation_id, persona.key, persona.identity_version),
+                    )
+            except _ConversationVersionConflict:
+                continue
+            return
+        raise RuntimeError("conversation changed too frequently")
+
+    def _ensure_conversation(self, chat_id: int, persona_key: str) -> None:
         with self._connection:
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO conversation (platform, chat_id, active_persona_key)
                 VALUES ('telegram', ?, ?)
                 """,
-                (chat_id, persona.key),
-            )
-            self._connection.execute(
-                """
-                UPDATE conversation
-                SET active_persona_key = ?
-                WHERE platform = 'telegram' AND chat_id = ?
-                """,
-                (persona.key, chat_id),
-            )
-            conversation_id = self._connection.execute(
-                """
-                SELECT id
-                FROM conversation
-                WHERE platform = 'telegram' AND chat_id = ?
-                """,
-                (chat_id,),
-            ).fetchone()[0]
-            self._connection.execute(
-                """
-                INSERT OR IGNORE INTO persona_session
-                    (conversation_id, persona_key, identity_version)
-                VALUES (?, ?, ?)
-                """,
-                (conversation_id, persona.key, persona.identity_version),
+                (chat_id, persona_key),
             )
 
     def conversation_count(self) -> int:
@@ -142,6 +148,13 @@ class SQLiteConversationStore:
 
     def persona_session_count(self) -> int:
         return self._connection.execute("SELECT COUNT(*) FROM persona_session").fetchone()[0]
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _ConversationVersionConflict(RuntimeError):
+    pass
 
 
 class TelegramRouter:
