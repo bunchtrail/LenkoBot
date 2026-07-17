@@ -18,7 +18,7 @@
 | Исходный код | Standalone LenkoBot с минимальной выборкой узких компонентов Hermes под MIT; полный fork отсутствует |
 | Развёртывание | Локальный Windows first, portable data/config/secrets boundary для Docker/VPS |
 | Telegram transport | `aiogram==3.29.1` через узкий adapter boundary; long polling в MVP, публичный webhook отсутствует |
-| Grok | `oauth_then_api_key`; OAuth entitlement для `grok-4.5` подтверждён 17 июля 2026. API key fallback только для распознанного entitlement-отказа и с явным уведомлением о расходах |
+| Grok | Первый local composition root использует `oauth_only`; OAuth entitlement для `grok-4.5` подтверждён 17 июля 2026. API-key fallback добавляется только после подтверждённого entitlement classifier и с явным уведомлением о расходах |
 | Персоны | Несколько `persona_id` внутри одного profile, не несколько Hermes profiles |
 | Память | Shared facts/tasks + private memory/relationship активной персоны |
 | Transcripts | У каждой персоны отдельная session lane; персона не читает чужие transcripts |
@@ -196,6 +196,17 @@ IncomingTelegramMessage
 - Concrete Windows Credential Manager adapter и device-code login workflow входят в эту vertical. Composition root обязан fail-closed, если secure store, refresh client или lock не сконфигурированы.
 - Windows adapter использует Credential Manager generic blob с лимитом 2560 bytes и named `Local\\` mutex. `WAIT_ABANDONED` продолжает lifecycle после повторного чтения state; timeout/failure блокирует refresh.
 - Device login разделён на `start` (URL/code для presentation) и `complete` (poll и одно сохранение state под refresh lock). Device и token endpoints принимают только approved HTTPS hosts на default port; verification URI из внешнего ответа проходит такую же проверку. Автоматическое открытие браузера и persistence при terminal error не входят в contract.
+- Первый local composition root создаёт `CredentialPolicy.OAUTH_ONLY` и не читает `XAI_API_KEY`. `oauth_then_api_key` остаётся будущей opt-in policy после отдельного решения о classifier.
+
+## Composition root и локальный запуск
+
+`Confirmed`: Windows-first запуск использует CLI entry point `lenkobot` с явными командами `login` и `run`.
+
+- `lenkobot login --config <path>` валидирует non-secret TOML config, использует OAuth client ID, показывает verification URL и user code, затем завершает device polling и сохраняет state через Credential Manager. Он не открывает браузер автоматически и не печатает device/access/refresh token.
+- `lenkobot run --config <path> [--data-root <path>]` читает Telegram bot token только из `TELEGRAM_BOT_TOKEN`. Отсутствующий/пустой secret, OAuth state, Telegram allowlist или persona config останавливает запуск до создания `Bot` или polling.
+- `config.example.toml` определяет один TOML contract: root `default_persona_key` и `[[personas]]`, `[telegram].allowed_user_id` и `[oauth].client_id`. В конфиге нет Telegram token, API key, device code, access token или refresh token.
+- Default data root равен `<config parent>/data`; `--data-root` является явным override. Root передаёт один `<data root>/state.db` обоим SQLite stores и закрывает оба connection при normal или exceptional polling exit.
+- Current root использует fixed profile `default`, account-specific proof-tested OAuth inference URL `https://api.x.ai/v1` и model `grok-4.5`. Совместимость OAuth bearer с этим direct host остаётся `Open`; account switching, custom inference hosts и Docker/VPS secret backend остаются отдельными решениями.
 
 ## Application service и Telegram presentation
 
@@ -274,3 +285,4 @@ IncomingTelegramMessage
 - Один scheduled reminder приводит к одной логической доставке при restart/retry.
 - В persistent store отсутствуют raw binary Telegram attachments и raw chain-of-thought.
 - Перенос data directory в Docker/VPS не меняет identifiers, migrations или memory semantics.
+- `login` не выводит OAuth token state, а `run` без OAuth state или Telegram secret не создаёт Telegram `Bot` и не начинает polling.

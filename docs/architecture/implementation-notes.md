@@ -9,7 +9,7 @@
 - MVP adapter регистрирует только `message` updates и передаёт Telegram API список зарегистрированных типов при long polling. Callback, inline, media и webhook остаются отдельными вертикалями.
 - Первая xAI provider vertical ограничена non-streaming text Responses API. Credentials, transport и fallback policy разделены; default transport pinning разрешает только HTTPS host `api.x.ai`.
 - `oauth_then_api_key` требует explicit `EntitlementDenied`; undocumented raw `403` остаётся generic provider error и не включает платный fallback.
-- MVP использует `oauth_then_api_key`; fallback остаётся явной политикой, а не неявной реакцией на любой `401/403`.
+- Долгосрочная `oauth_then_api_key` policy остаётся explicit opt-in, а не неявной реакцией на любой `401/403`; первый local composition root до появления classifier использует `oauth_only`.
 - Application service связывает private-only router с non-streaming provider через typed Telegram response port. `/persona` и обычный text turn обрабатываются до provider presentation разными ветками.
 - Response contract содержит explicit target `chat_id` и `status`/`notice`/`final`/`error` kinds. Fallback notice строится только по `XaiTextResponse.fallback_from`.
 - Blocking provider call выполняется через `asyncio.to_thread`, чтобы не блокировать aiogram event loop; SQLite routing остаётся в event-loop thread из-за thread-bound connection.
@@ -29,6 +29,9 @@
 - Concrete Windows deployment выбран через Credential Manager generic blob и named `Local\\` mutex; DPAPI-файл в эту vertical не добавляется.
 - Device flow имеет отдельные `start` и `complete` операции: presentation получает verification data отдельно, а token state сохраняется только после успешного poll под refresh lock.
 - Device authorization, refresh и inference transport принимают bearer-token endpoints только на approved HTTPS host и default port; malformed external device payload превращается в controlled credential error без persistence.
+- Первый composition root использует два явных CLI workflow: `login` для user-mediated device authorization и `run` для Telegram polling. Автоматический browser launch не добавляется.
+- До появления подтверждённого entitlement classifier root использует только `oauth_only` и не читает `XAI_API_KEY`; это исключает неявные расходы и является обратимым сужением ранее запланированной fallback policy.
+- Runtime config не содержит secrets: persona catalog, Telegram allowlist и OAuth client ID находятся в TOML; Telegram token приходит только через environment. Root владеет lifecycle двух thread-bound SQLite stores с общим `state.db`.
 
 ## Находки
 
@@ -61,7 +64,7 @@
 - Политика бэкапа SQLite, список предзаданных personas и media/STT provider остаются `Open` в `mvp-spec.md`.
 - Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью, несмотря на успешную проверку account entitlement.
 - Совместимость OAuth bearer с direct `api.x.ai/v1` и точная классификация entitlement denial требуют отдельного подтверждения. До него raw `403` не должен запускать платный API-key fallback.
-- Portable Docker/VPS secret backend, token revocation, account switching и device-login presentation UX остаются отдельными verticals; текущий Windows adapter не создаёт plaintext persistence.
+- Portable Docker/VPS secret backend, token revocation, account switching и custom inference host остаются отдельными verticals; текущий Windows adapter не создаёт plaintext persistence.
 - Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая реализация должна сохранять только active records в context.
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
 
@@ -107,3 +110,9 @@
 - После concrete secure backend vertical OAuth-related suite завершился: `44 passed`.
 - Read-only native Windows smoke успешно вызвал `CredReadW` для уникального отсутствующего target и acquire/release named mutex; credential не создавался и token state не выводился.
 - Финальный полный suite завершился: `82 passed`; `compileall`, `uv lock --check` и `git diff --check` прошли успешно.
+- Finding-unknowns для composition root выявил два high-impact решения: отдельный explicit `login` workflow и отказ от API-key fallback до подтверждённого entitlement classifier; оба подтверждены пользователем.
+- Красный цикл composition root начался с `ModuleNotFoundError` для отсутствующего `lenkobot.runtime`.
+- Runtime tests подтверждают non-secret TOML parsing, default data root, redacted device-login presentation, fail-closed startup без OAuth state, общий `state.db`, `oauth_only` composition и закрытие обоих stores после normal или exceptional polling exit.
+- CLI help smoke успешно проверил `python -m lenkobot --help` и installed `lenkobot --help`; `config.example.toml` успешно проходит runtime parsing без secrets.
+- Независимый review composition root не нашёл code findings; одна stale documentation policy была выровнена с `oauth_only` contract.
+- После composition root vertical полный suite завершился: `87 passed`; `compileall`, `uv lock --check` и `git diff --check` прошли успешно.

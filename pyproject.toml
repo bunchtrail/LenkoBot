@@ -9,6 +9,9 @@ description = "Personal Telegram companion bot"
 requires-python = ">=3.13,<3.14"
 dependencies = ["aiogram==3.29.1"]
 
+[project.scripts]
+lenkobot = "lenkobot.runtime:main"
+
 [dependency-groups]
 dev = ["pytest==8.3.5"]
 
