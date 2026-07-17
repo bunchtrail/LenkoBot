@@ -24,6 +24,8 @@
 - 17 июля 2026 OAuth device-code flow xAI завершился успешно. Единичный запрос `POST /v1/responses` для `grok-4.5` вернул `HTTP 200`.
 - 17 июля 2026 Terra research зафиксировал official REST contract: direct API-key request на `api.x.ai/v1/responses`, text в `output[]`, rate limit `429`; OAuth inference host и entitlement error schema остаются `Open`.
 - Проверка не сохраняла access token, refresh token или device code в проекте или persistent credential store.
+- Для следующей vertical подтверждён strict path: сначала OAuth credential lifecycle, затем composition root; временный `api_key_only` bootstrap не выбирается.
+- OAuth lifecycle владеет только refresh orchestration: secure store, refresh client и exclusive lock инжектируются отдельно, а полный цикл `read -> refresh -> persist` выполняется под lock.
 
 ## Находки
 
@@ -43,7 +45,7 @@
 
 - Вместо Hermes CLI был использован узкий standard-library OAuth proof. Он проверяет тот же xAI device endpoint, client ID, scopes, token endpoint и Responses endpoint, но не заменяет интеграционный тест будущего LenkoBot provider adapter.
 - Tool runtime завершает фоновые дочерние процессы после окончания команды. Для проверки применён двухфазный flow: device code удерживался в контексте запуска, а token запрашивался и использовался только во втором коротком процессе.
-- `OAuthCredentialSource` принимает access token через injected secure loader и не владеет persistence/device login/refresh. Это сохраняет DPAPI/Credential Manager boundary до отдельной credential vertical и исключает plaintext token store.
+- `OAuthCredentialSource` получает access token через `OAuthRefreshCoordinator`; coordinator не знает конкретного secure backend и не создаёт plaintext token store.
 - Automatic retry/backoff для `429` и `5xx` не входит в первую provider vertical; typed error сохраняется вызывающему application service.
 - Старый `TelegramRouter.handle()` и synchronous `ReplyPort` сохранены для совместимости первой вертикали; application service использует новый `TelegramRouter.route()` без reply/presentation side effect, при этом SQLite allocation остаётся его ожидаемым stateful поведением.
 - Вместо немедленной миграции `conversation.active_persona_key` на `active_persona_id` memory store добавляет собственный persona registry и разрешает key в ID при построении контекста. Это сохраняет существующие session identifiers и ограничивает blast radius вертикали.
@@ -56,7 +58,7 @@
 - Политика бэкапа SQLite, список предзаданных personas и media/STT provider остаются `Open` в `mvp-spec.md`.
 - Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью, несмотря на успешную проверку account entitlement.
 - Совместимость OAuth bearer с direct `api.x.ai/v1` и точная классификация entitlement denial требуют отдельного подтверждения. До него raw `403` не должен запускать платный API-key fallback.
-- Secure OAuth loader с refresh serialization и bounded retry policy для transient xAI failures остаются отдельными вертикалями.
+- Concrete Windows DPAPI/Credential Manager adapter, device-code login UX, token revocation и cross-platform secret backend остаются отдельными verticals; текущий lifecycle не создаёт plaintext persistence.
 - Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая реализация должна сохранять только active records в context.
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
 
@@ -93,3 +95,7 @@
 - Schema tests подтверждают additive migration unversioned conversation/session IDs, fail-closed отказ от future version и rollback неуспешной migration без продвижения `user_version`.
 - Concurrent routing tests подтверждают одну session lane для одновременных turns, монотонный routing epoch и соответствие `RoutedTurn` валидной persona lane при гонке route со switch.
 - После persistence vertical targeted suite завершился: `17 passed`; полный suite: `51 passed`. `compileall`, `uv lock --check` и `git diff --check` завершились успешно.
+- Красный цикл OAuth lifecycle начался с `ImportError` для отсутствующего `OAuthRefreshCoordinator`.
+- Lifecycle tests подтверждают отсутствие refresh для валидного access token, rotation и persist для expired token, один refresh при конкурентных чтениях, сохранение старого state при ошибке, form-encoded token request, host pinning и отсутствие token secrets в OAuth errors.
+- После OAuth lifecycle targeted provider suite завершился: `24 passed`; полный suite: `62 passed`. `compileall`, `uv lock --check` и `git diff --check` завершились успешно.
+- Concrete secure store для Windows и device-code login в эту проверку не входили; lifecycle принимает их через injected `OAuthCredentialStore` и exclusive lock.

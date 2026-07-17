@@ -185,12 +185,15 @@ IncomingTelegramMessage
 
 `Confirmed`: первая provider vertical реализует только non-streaming text request к Responses API. Она не подключается к Telegram renderer до появления отдельного application service.
 
-- `CredentialSource` возвращает bearer, expiry, base URL и source identity. API-key source использует direct `https://api.x.ai/v1`; OAuth source получает access token через injected secure loader и требует explicit base URL.
+- `CredentialSource` возвращает bearer, expiry, base URL и source identity. API-key source использует direct `https://api.x.ai/v1`; OAuth source получает access token через refresh coordinator и требует explicit base URL.
 - Bearer values не появляются в `repr`, errors или result objects. Transport принимает только HTTPS endpoint с host из explicit allowlist; default allowlist содержит `api.x.ai`.
 - Minimal request имеет `model` и string `input`. Final text собирается только из assistant `message` items и `output_text` parts; reasoning и неизвестные items пропускаются.
 - Provider result содержит credential source и `fallback_from`, чтобы presentation layer мог явно уведомить пользователя о переходе на платный API key.
 - `oauth_then_api_key` требует обе configured credential sources и переключается только после typed `EntitlementDenied`. Generic `401`, raw `403`, `429`, network failure и `5xx` не запускают fallback.
 - Transport по умолчанию не угадывает entitlement по undocumented response body. Подтверждённый classifier может быть injected отдельно без изменения policy owner.
+- OAuth lifecycle использует injected `OAuthCredentialStore`, `OAuthRefreshClient` и exclusive lock. Coordinator под lock повторно читает state, использует ещё валидный access token или выполняет refresh и сохраняет результат до освобождения lock; это предотвращает гонки rotating refresh token.
+- `OAuthCredentialSource` не знает формат или место хранения секретов и получает access token только через coordinator. Token state и request secrets не попадают в SQLite, `repr` или provider errors.
+- В эту vertical не входят concrete Windows DPAPI/Credential Manager adapter и device-code login workflow. Composition root обязан fail-closed, если secure store, refresh client или lock не сконфигурированы.
 
 ## Application service и Telegram presentation
 

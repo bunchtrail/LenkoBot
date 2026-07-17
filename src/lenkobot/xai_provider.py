@@ -1,11 +1,11 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import json
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -20,6 +20,13 @@ class BearerCredential:
 @dataclass(frozen=True, slots=True)
 class OAuthAccessToken:
     value: str = field(repr=False)
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthTokenState:
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     expires_at: datetime
 
 
@@ -48,29 +55,120 @@ class ApiKeyCredentialSource:
         )
 
 
+class OAuthCredentialStore(Protocol):
+    def load(self) -> OAuthTokenState | None: ...
+
+    def save(self, state: OAuthTokenState) -> None: ...
+
+
+class OAuthRefreshClient(Protocol):
+    def refresh(self, state: OAuthTokenState) -> OAuthTokenState: ...
+
+
+class OAuthRefreshLock(Protocol):
+    def __enter__(self) -> object: ...
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool | None: ...
+
+
+class OAuthRefreshCoordinator:
+    def __init__(
+        self,
+        store: OAuthCredentialStore,
+        refresh_client: OAuthRefreshClient,
+        *,
+        lock: OAuthRefreshLock,
+        now: Callable[[], datetime] | None = None,
+        refresh_skew: timedelta = timedelta(seconds=60),
+    ) -> None:
+        if store is None or refresh_client is None or lock is None:
+            raise ValueError("OAuth refresh dependencies are required")
+        if refresh_skew.total_seconds() < 0:
+            raise ValueError("OAuth refresh skew cannot be negative")
+
+        self._store = store
+        self._refresh_client = refresh_client
+        self._lock = lock
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._refresh_skew = refresh_skew
+
+    def get_access_token(self) -> OAuthAccessToken:
+        with self._lock:
+            state = self._load_state()
+            now = self._now()
+            self._validate_clock(now)
+            self._validate_state(state)
+            if state.expires_at > now + self._refresh_skew:
+                return self._as_access_token(state)
+            if not state.refresh_token.strip():
+                raise CredentialUnavailable("OAuth refresh token is unavailable")
+
+            try:
+                refreshed = self._refresh_client.refresh(state)
+            except (CredentialUnavailable, ProviderRequestError):
+                raise
+            except Exception:
+                raise CredentialUnavailable("OAuth token refresh failed") from None
+
+            self._validate_state(refreshed)
+            if refreshed.expires_at <= now:
+                raise CredentialUnavailable("OAuth refresh returned an expired token")
+            self._save_state(refreshed)
+            return self._as_access_token(refreshed)
+
+    def _load_state(self) -> OAuthTokenState:
+        try:
+            state = self._store.load()
+        except Exception:
+            raise CredentialUnavailable("OAuth credential store could not load state") from None
+        if state is None:
+            raise CredentialUnavailable("OAuth credential state is unavailable")
+        return state
+
+    def _save_state(self, state: OAuthTokenState) -> None:
+        try:
+            self._store.save(state)
+        except Exception:
+            raise CredentialUnavailable("OAuth credential state could not be saved") from None
+
+    @staticmethod
+    def _validate_clock(now: datetime) -> None:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise CredentialUnavailable("OAuth clock must include a timezone")
+
+    @staticmethod
+    def _validate_state(state: OAuthTokenState) -> None:
+        if not isinstance(state, OAuthTokenState):
+            raise CredentialUnavailable("OAuth credential state is invalid")
+        if not isinstance(state.access_token, str) or not state.access_token.strip():
+            raise CredentialUnavailable("OAuth access token is empty")
+        if not isinstance(state.refresh_token, str):
+            raise CredentialUnavailable("OAuth refresh token is invalid")
+        if not isinstance(state.expires_at, datetime) or state.expires_at.tzinfo is None:
+            raise CredentialUnavailable("OAuth token expiry must include a timezone")
+
+    @staticmethod
+    def _as_access_token(state: OAuthTokenState) -> OAuthAccessToken:
+        return OAuthAccessToken(value=state.access_token, expires_at=state.expires_at)
+
+
 class OAuthCredentialSource:
     def __init__(
         self,
-        load_access_token: Callable[[], OAuthAccessToken],
+        coordinator: OAuthRefreshCoordinator,
         *,
         base_url: str,
-        now: Callable[[], datetime] | None = None,
     ) -> None:
+        if coordinator is None:
+            raise ValueError("OAuth refresh coordinator is required")
         if not base_url.strip():
             raise ValueError("OAuth inference base URL cannot be empty")
 
-        self._load_access_token = load_access_token
+        self._coordinator = coordinator
         self._base_url = base_url
-        self._now = now or (lambda: datetime.now(timezone.utc))
 
     def get_credential(self) -> BearerCredential:
-        access_token = self._load_access_token()
-        if access_token.expires_at.tzinfo is None:
-            raise CredentialUnavailable("OAuth token expiry must include a timezone")
-        if access_token.expires_at <= self._now():
-            raise CredentialUnavailable("OAuth access token has expired")
-        if not access_token.value:
-            raise CredentialUnavailable("OAuth access token is empty")
+        access_token = self._coordinator.get_access_token()
 
         return BearerCredential(
             token=access_token.value,
@@ -166,6 +264,172 @@ class UrllibJsonHttpClient:
                 raw_body="",
                 headers={},
             ) from error
+
+    def post_form(
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, str],
+    ) -> HttpResponse:
+        request_headers = dict(headers)
+        request_headers.setdefault(
+            "Content-Type", "application/x-www-form-urlencoded"
+        )
+        request = Request(
+            url,
+            data=urlencode(payload).encode("utf-8"),
+            headers=request_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds) as response:
+                return HttpResponse(
+                    status=response.status,
+                    headers=dict(response.headers),
+                    body=response.read().decode("utf-8", errors="replace"),
+                )
+        except HTTPError as error:
+            return HttpResponse(
+                status=error.code,
+                headers=dict(error.headers or {}),
+                body=error.read().decode("utf-8", errors="replace"),
+            )
+        except (URLError, TimeoutError, OSError) as error:
+            raise ProviderRequestError(
+                "xAI OAuth token request failed",
+                status=None,
+                code="network_error",
+                raw_body="",
+                headers={},
+            ) from error
+
+
+class FormHttpClient(Protocol):
+    def post_form(
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, str],
+    ) -> HttpResponse: ...
+
+
+class XaiOAuthRefreshClient:
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        http_client: FormHttpClient | None = None,
+        token_url: str = "https://auth.x.ai/oauth2/token",
+        now: Callable[[], datetime] | None = None,
+        entitlement_classifier: Callable[[ProviderRequestError], bool] | None = None,
+    ) -> None:
+        if not client_id.strip():
+            raise ValueError("OAuth client ID cannot be empty")
+        self._validate_token_url(token_url)
+        self._client_id = client_id
+        self._http_client = http_client or UrllibJsonHttpClient()
+        self._token_url = token_url
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._entitlement_classifier = entitlement_classifier
+
+    def refresh(self, state: OAuthTokenState) -> OAuthTokenState:
+        if not state.refresh_token.strip():
+            raise CredentialUnavailable("OAuth refresh token is unavailable")
+        response = self._http_client.post_form(
+            self._token_url,
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": state.refresh_token,
+                "client_id": self._client_id,
+            },
+        )
+        body = self._decode_response(response)
+        if not 200 <= response.status < 300:
+            error = self._request_error(response, body)
+            if (
+                self._entitlement_classifier is not None
+                and self._entitlement_classifier(error)
+            ):
+                raise EntitlementDenied.from_error(error)
+            raise error
+
+        access_token = body.get("access_token")
+        refresh_token = body.get("refresh_token", state.refresh_token)
+        expires_in = body.get("expires_in")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise CredentialUnavailable("OAuth refresh returned no access token")
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            raise CredentialUnavailable("OAuth refresh returned no refresh token")
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or expires_in <= 0
+        ):
+            raise CredentialUnavailable("OAuth refresh returned invalid expiry")
+        now = self._now()
+        if now.tzinfo is None:
+            raise CredentialUnavailable("OAuth clock must include a timezone")
+        return OAuthTokenState(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=now + timedelta(seconds=float(expires_in)),
+        )
+
+    @staticmethod
+    def _validate_token_url(token_url: str) -> None:
+        parsed = urlsplit(token_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "auth.x.ai"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("OAuth token target is not an allowed HTTPS host")
+
+    @staticmethod
+    def _decode_response(response: HttpResponse) -> dict[str, object]:
+        try:
+            body = json.loads(response.body)
+        except json.JSONDecodeError as error:
+            raise ProviderRequestError(
+                "xAI OAuth token endpoint returned invalid JSON",
+                status=response.status,
+                code="invalid_json",
+                raw_body="",
+                headers={},
+            ) from error
+        if not isinstance(body, dict):
+            raise ProviderRequestError(
+                "xAI OAuth token endpoint returned an invalid response",
+                status=response.status,
+                code="invalid_json",
+                raw_body="",
+                headers={},
+            )
+        return body
+
+    @staticmethod
+    def _request_error(
+        response: HttpResponse,
+        body: Mapping[str, object],
+    ) -> ProviderRequestError:
+        error_code = body.get("error")
+        if isinstance(error_code, dict):
+            nested_code = error_code.get("code")
+            error_code = nested_code if isinstance(nested_code, str) else None
+        return ProviderRequestError(
+            "xAI OAuth token refresh failed",
+            status=response.status,
+            code=error_code if isinstance(error_code, str) else None,
+            raw_body="",
+            headers={},
+        )
 
 
 @dataclass(frozen=True, slots=True)

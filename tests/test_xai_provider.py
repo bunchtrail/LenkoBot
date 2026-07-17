@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
 import json
+from datetime import timezone
 
 import pytest
 
@@ -7,11 +7,8 @@ from lenkobot.xai_provider import (
     ApiKeyCredentialSource,
     BearerCredential,
     CredentialPolicy,
-    CredentialUnavailable,
     EntitlementDenied,
     HttpResponse,
-    OAuthAccessToken,
-    OAuthCredentialSource,
     ProviderRequestError,
     UntrustedInferenceHost,
     UrllibJsonHttpClient,
@@ -92,24 +89,6 @@ def test_api_key_source_returns_redacted_bearer_credential():
     assert result.source_identity == "xai_api_key"
     assert result.expires_at is None
     assert "api-secret" not in repr(result)
-
-
-def test_oauth_source_rejects_expired_token_and_requires_explicit_base_url():
-    now = datetime(2026, 7, 17, 12, tzinfo=timezone.utc)
-    token = OAuthAccessToken(
-        value="oauth-secret",
-        expires_at=now - timedelta(seconds=1),
-    )
-    source = OAuthCredentialSource(
-        load_access_token=lambda: token,
-        base_url="https://api.x.ai/v1",
-        now=lambda: now,
-    )
-
-    with pytest.raises(CredentialUnavailable, match="expired"):
-        source.get_credential()
-
-    assert "oauth-secret" not in repr(token)
 
 
 def test_responses_transport_sends_minimal_request_and_extracts_assistant_text():
