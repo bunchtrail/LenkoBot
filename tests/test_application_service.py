@@ -1,6 +1,8 @@
 import asyncio
 
 from lenkobot.application_service import TelegramApplicationService
+from lenkobot.context_builder import ContextBuilder
+from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
 from lenkobot.personas import PersonaCatalog
 from lenkobot.telegram_presentation import TelegramResponseKind
 from lenkobot.telegram_router import IncomingTelegramMessage, SQLiteConversationStore, TelegramRouter
@@ -51,7 +53,7 @@ def build_catalog(tmp_path):
     return PersonaCatalog.from_toml(config_path)
 
 
-def build_service(tmp_path, provider, response_port):
+def build_service(tmp_path, provider, response_port, *, context_builder=None):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
         allowed_user_id=42,
@@ -64,6 +66,7 @@ def build_service(tmp_path, provider, response_port):
         persona_catalog=catalog,
         provider=provider,
         response_port=response_port,
+        context_builder=context_builder,
     ), router
 
 
@@ -268,3 +271,110 @@ def test_unauthorized_input_is_ignored_without_a_response_port(tmp_path):
 
     assert result is None
     assert provider.prompts == []
+
+
+def test_application_service_builds_provider_prompt_with_scoped_memory(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Remembered answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    catalog = build_catalog(tmp_path)
+    companion = catalog.get("companion")
+    companion_id = memory_store.register_persona(companion)
+    memory_store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.PERSONA_PRIVATE,
+            persona_id=companion_id,
+            kind="preference",
+            content="Prefer examples.",
+        )
+    )
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        context_builder=ContextBuilder(memory_store),
+    )
+
+    asyncio.run(service.handle(telegram_message("Explain it")))
+
+    assert len(provider.prompts) == 1
+    assert "Prefer examples." in provider.prompts[0]
+    assert provider.prompts[0].endswith("User message:\nExplain it")
+
+
+def test_unauthorized_input_is_rejected_before_context_builder(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Should not be called",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    context_builder = RecordingContextBuilder()
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        context_builder=context_builder,
+    )
+
+    result = asyncio.run(
+        service.handle(telegram_message("Reveal memory", user_id=99, chat_id=501))
+    )
+
+    assert result is None
+    assert context_builder.calls == []
+    assert provider.prompts == []
+    assert response_port.responses == []
+
+
+def test_context_failure_returns_safe_error_without_calling_provider(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Should not be called",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        context_builder=FailingContextBuilder(),
+    )
+
+    result = asyncio.run(service.handle(telegram_message("Remember")))
+
+    assert result is None
+    assert provider.prompts == []
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.STATUS,
+        TelegramResponseKind.ERROR,
+    ]
+    assert "private-memory-secret" not in response_port.responses[-1].text
+
+
+class FailingContextBuilder:
+    def build(self, **kwargs):
+        raise RuntimeError("private-memory-secret")
+
+
+class RecordingContextBuilder:
+    def __init__(self):
+        self.calls = []
+
+    def build(self, **kwargs):
+        self.calls.append(kwargs)
+        return "prompt"

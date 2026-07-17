@@ -17,6 +17,10 @@ class TextProvider(Protocol):
     def respond(self, prompt: str) -> XaiTextResponse: ...
 
 
+class TurnContextBuilder(Protocol):
+    def build(self, *, user_id: int, persona: Persona, turn: RoutedTurn) -> str: ...
+
+
 class TelegramApplicationService:
     def __init__(
         self,
@@ -24,11 +28,13 @@ class TelegramApplicationService:
         persona_catalog: PersonaCatalog,
         provider: TextProvider,
         response_port: TelegramResponsePort | None = None,
+        context_builder: TurnContextBuilder | None = None,
     ) -> None:
         self._router = router
         self._persona_catalog = persona_catalog
         self._provider = provider
         self._response_port = response_port
+        self._context_builder = context_builder
 
     async def handle(
         self,
@@ -59,9 +65,16 @@ class TelegramApplicationService:
             )
         )
         try:
+            prompt = self._build_prompt(persona, turn)
+            if self._context_builder is not None:
+                prompt = self._context_builder.build(
+                    user_id=message.user_id,
+                    persona=persona,
+                    turn=turn,
+                )
             result = await asyncio.to_thread(
                 self._provider.respond,
-                self._build_prompt(persona, turn),
+                prompt,
             )
         except Exception:
             await presenter.send(

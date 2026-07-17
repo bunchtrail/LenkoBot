@@ -1,0 +1,499 @@
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
+import json
+from pathlib import Path
+import sqlite3
+
+from .personas import Persona
+
+
+class MemoryScope(StrEnum):
+    SHARED = "shared"
+    PERSONA_PRIVATE = "persona_private"
+    RELATIONSHIP = "relationship"
+
+
+class MemoryStatus(StrEnum):
+    ACTIVE = "active"
+    DELETED = "deleted"
+
+
+@dataclass(frozen=True, slots=True)
+class NewMemory:
+    user_id: int
+    scope: MemoryScope | str
+    kind: str
+    content: str
+    persona_id: int | None = None
+    relationship_id: int | None = None
+    provenance_session_id: int | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecord:
+    id: int
+    user_id: int
+    scope: MemoryScope
+    kind: str
+    content: str
+    persona_id: int | None
+    relationship_id: int | None
+    provenance_session_id: int | None
+    status: MemoryStatus
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class Relationship:
+    id: int
+    user_id: int
+    persona_id: int
+    summary: str
+    state_json: str
+    version: int
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryLimits:
+    shared: int = 20
+    persona_private: int = 20
+    relationship: int = 20
+    total: int = 60
+
+    def __post_init__(self) -> None:
+        values = (self.shared, self.persona_private, self.relationship, self.total)
+        if any(value < 0 for value in values):
+            raise ValueError("memory limits cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryContext:
+    shared: tuple[MemoryRecord, ...]
+    persona_private: tuple[MemoryRecord, ...]
+    relationship: tuple[MemoryRecord, ...]
+    relationship_state: Relationship | None
+
+    @property
+    def records(self) -> tuple[MemoryRecord, ...]:
+        return tuple(
+            sorted(
+                self.shared + self.persona_private + self.relationship,
+                key=lambda record: (record.updated_at, record.id),
+                reverse=True,
+            )
+        )
+
+
+class RelationshipVersionConflict(RuntimeError):
+    pass
+
+
+class SQLiteMemoryStore:
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        profile_id: str = "default",
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not profile_id.strip():
+            raise ValueError("profile_id cannot be empty")
+        self._profile_id = profile_id
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._connection = sqlite3.connect(database_path)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS persona (
+                id INTEGER PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                identity_prompt TEXT NOT NULL,
+                identity_version INTEGER NOT NULL CHECK(identity_version > 0),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'disabled')),
+                UNIQUE(profile_id, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS relationship (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL REFERENCES persona(id) ON DELETE CASCADE,
+                summary TEXT NOT NULL DEFAULT '',
+                state_json TEXT NOT NULL DEFAULT '{}'
+                    CHECK(json_valid(state_json)),
+                version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, persona_id),
+                UNIQUE(id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                scope TEXT NOT NULL
+                    CHECK(scope IN ('shared', 'persona_private', 'relationship')),
+                persona_id INTEGER REFERENCES persona(id) ON DELETE CASCADE,
+                relationship_id INTEGER,
+                kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+                content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+                provenance_session_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'deleted')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (relationship_id, user_id)
+                    REFERENCES relationship(id, user_id) ON DELETE CASCADE,
+                CHECK(
+                    (scope = 'shared' AND persona_id IS NULL AND relationship_id IS NULL)
+                    OR
+                    (scope = 'persona_private' AND persona_id IS NOT NULL
+                        AND relationship_id IS NULL)
+                    OR
+                    (scope = 'relationship' AND persona_id IS NULL
+                        AND relationship_id IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS memory_user_scope_persona_updated_idx
+                ON memory(user_id, scope, persona_id, updated_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS memory_relationship_updated_idx
+                ON memory(relationship_id, updated_at DESC, id DESC);
+            """
+        )
+
+    def register_persona(self, persona: Persona) -> int:
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO persona (
+                    profile_id, key, display_name, identity_prompt,
+                    identity_version, status
+                )
+                VALUES (?, ?, ?, ?, ?, 'active')
+                ON CONFLICT(profile_id, key) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    identity_prompt = excluded.identity_prompt,
+                    identity_version = excluded.identity_version,
+                    status = 'active'
+                """,
+                (
+                    self._profile_id,
+                    persona.key,
+                    persona.display_name,
+                    persona.identity_prompt,
+                    persona.identity_version,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM persona WHERE profile_id = ? AND key = ?",
+                (self._profile_id, persona.key),
+            ).fetchone()
+        return int(row["id"])
+
+    def persona_id_for_key(self, key: str) -> int | None:
+        row = self._connection.execute(
+            "SELECT id FROM persona WHERE profile_id = ? AND key = ?",
+            (self._profile_id, key),
+        ).fetchone()
+        return None if row is None else int(row["id"])
+
+    def ensure_relationship(self, *, user_id: int, persona_id: int) -> Relationship:
+        timestamp = self._timestamp()
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO relationship (
+                    user_id, persona_id, summary, state_json, version, updated_at
+                )
+                VALUES (?, ?, '', '{}', 1, ?)
+                """,
+                (user_id, persona_id, timestamp),
+            )
+        relationship = self.get_relationship(user_id=user_id, persona_id=persona_id)
+        if relationship is None:
+            raise RuntimeError("relationship was not created")
+        return relationship
+
+    def get_relationship(
+        self,
+        *,
+        user_id: int,
+        persona_id: int,
+    ) -> Relationship | None:
+        row = self._connection.execute(
+            """
+            SELECT id, user_id, persona_id, summary, state_json, version, updated_at
+            FROM relationship
+            WHERE user_id = ? AND persona_id = ?
+            """,
+            (user_id, persona_id),
+        ).fetchone()
+        return None if row is None else self._relationship_from_row(row)
+
+    def update_relationship(
+        self,
+        *,
+        user_id: int,
+        persona_id: int,
+        summary: str,
+        state_json: str,
+        expected_version: int | None = None,
+    ) -> Relationship:
+        json.loads(state_json)
+        parameters: list[object] = [
+            summary,
+            state_json,
+            self._timestamp(),
+            user_id,
+            persona_id,
+        ]
+        version_clause = ""
+        if expected_version is not None:
+            version_clause = " AND version = ?"
+            parameters.append(expected_version)
+        with self._connection:
+            cursor = self._connection.execute(
+                f"""
+                UPDATE relationship
+                SET summary = ?, state_json = ?, version = version + 1, updated_at = ?
+                WHERE user_id = ? AND persona_id = ?{version_clause}
+                """,
+                parameters,
+            )
+        if cursor.rowcount == 0:
+            current = self.get_relationship(user_id=user_id, persona_id=persona_id)
+            if current is None:
+                raise KeyError("relationship not found")
+            raise RelationshipVersionConflict("relationship version changed")
+        updated = self.get_relationship(user_id=user_id, persona_id=persona_id)
+        if updated is None:
+            raise RuntimeError("relationship disappeared after update")
+        return updated
+
+    def create(self, memory: NewMemory) -> MemoryRecord:
+        scope = MemoryScope(memory.scope)
+        created_at = memory.created_at or self._timestamp()
+        updated_at = memory.updated_at or created_at
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO memory (
+                    user_id, scope, persona_id, relationship_id, kind, content,
+                    provenance_session_id, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    memory.user_id,
+                    scope.value,
+                    memory.persona_id,
+                    memory.relationship_id,
+                    memory.kind,
+                    memory.content,
+                    memory.provenance_session_id,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            row = self._select_memory(cursor.lastrowid, memory.user_id)
+        if row is None:
+            raise RuntimeError("memory record was not created")
+        return self._memory_from_row(row)
+
+    def get(self, memory_id: int, *, user_id: int) -> MemoryRecord | None:
+        row = self._select_memory(memory_id, user_id)
+        return None if row is None else self._memory_from_row(row)
+
+    def update(
+        self,
+        memory_id: int,
+        *,
+        user_id: int,
+        content: str,
+        kind: str | None = None,
+    ) -> MemoryRecord:
+        current = self.get(memory_id, user_id=user_id)
+        if current is None:
+            raise KeyError("memory record not found")
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE memory
+                SET kind = ?, content = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (
+                    current.kind if kind is None else kind,
+                    content,
+                    self._timestamp(),
+                    memory_id,
+                    user_id,
+                ),
+            )
+        updated = self.get(memory_id, user_id=user_id)
+        if updated is None:
+            raise RuntimeError("memory record disappeared after update")
+        return updated
+
+    def delete(self, memory_id: int, *, user_id: int) -> bool:
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM memory WHERE id = ? AND user_id = ?",
+                (memory_id, user_id),
+            )
+        return cursor.rowcount == 1
+
+    def promote_to_shared(self, memory_id: int, *, user_id: int) -> MemoryRecord:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE memory
+                SET scope = 'shared', persona_id = NULL, relationship_id = NULL,
+                    updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (self._timestamp(), memory_id, user_id),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError("memory record not found")
+        promoted = self.get(memory_id, user_id=user_id)
+        if promoted is None:
+            raise RuntimeError("memory record disappeared after promotion")
+        return promoted
+
+    def list_for_context(
+        self,
+        *,
+        user_id: int,
+        persona_id: int,
+        limits: MemoryLimits | None = None,
+    ) -> MemoryContext:
+        selected_limits = limits or MemoryLimits()
+        shared = self._list_records(
+            "m.user_id = ? AND m.scope = 'shared'",
+            (user_id,),
+            selected_limits.shared,
+        )
+        persona_private = self._list_records(
+            "m.user_id = ? AND m.scope = 'persona_private' AND m.persona_id = ?",
+            (user_id, persona_id),
+            selected_limits.persona_private,
+        )
+        relationship = self._list_records(
+            """
+            m.user_id = ? AND m.scope = 'relationship'
+            AND EXISTS (
+                SELECT 1
+                FROM relationship AS r
+                WHERE r.id = m.relationship_id
+                    AND r.user_id = m.user_id
+                    AND r.persona_id = ?
+            )
+            """,
+            (user_id, persona_id),
+            selected_limits.relationship,
+        )
+        all_records = sorted(
+            shared + persona_private + relationship,
+            key=lambda record: (record.updated_at, record.id),
+            reverse=True,
+        )[: selected_limits.total]
+        included_ids = {record.id for record in all_records}
+        return MemoryContext(
+            shared=tuple(record for record in shared if record.id in included_ids),
+            persona_private=tuple(
+                record for record in persona_private if record.id in included_ids
+            ),
+            relationship=tuple(
+                record for record in relationship if record.id in included_ids
+            ),
+            relationship_state=self.get_relationship(
+                user_id=user_id,
+                persona_id=persona_id,
+            ),
+        )
+
+    def memory_count(self) -> int:
+        return int(self._connection.execute("SELECT COUNT(*) FROM memory").fetchone()[0])
+
+    def relationship_count(self) -> int:
+        return int(
+            self._connection.execute("SELECT COUNT(*) FROM relationship").fetchone()[0]
+        )
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def _list_records(
+        self,
+        where_clause: str,
+        parameters: tuple[object, ...],
+        limit: int,
+    ) -> list[MemoryRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT
+                m.id, m.user_id, m.scope, m.persona_id, m.relationship_id,
+                m.kind, m.content, m.provenance_session_id, m.status,
+                m.created_at, m.updated_at
+            FROM memory AS m
+            WHERE m.status = 'active' AND {where_clause}
+            ORDER BY m.updated_at DESC, m.id DESC
+            LIMIT ?
+            """,
+            (*parameters, limit),
+        ).fetchall()
+        return [self._memory_from_row(row) for row in rows]
+
+    def _select_memory(self, memory_id: int, user_id: int) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT
+                id, user_id, scope, persona_id, relationship_id, kind, content,
+                provenance_session_id, status, created_at, updated_at
+            FROM memory
+            WHERE id = ? AND user_id = ? AND status = 'active'
+            """,
+            (memory_id, user_id),
+        ).fetchone()
+
+    @staticmethod
+    def _memory_from_row(row: sqlite3.Row) -> MemoryRecord:
+        return MemoryRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            scope=MemoryScope(row["scope"]),
+            kind=str(row["kind"]),
+            content=str(row["content"]),
+            persona_id=row["persona_id"],
+            relationship_id=row["relationship_id"],
+            provenance_session_id=row["provenance_session_id"],
+            status=MemoryStatus(row["status"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _relationship_from_row(row: sqlite3.Row) -> Relationship:
+        return Relationship(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            persona_id=int(row["persona_id"]),
+            summary=str(row["summary"]),
+            state_json=str(row["state_json"]),
+            version=int(row["version"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _timestamp(self) -> str:
+        return self._clock().astimezone(timezone.utc).isoformat(timespec="microseconds")

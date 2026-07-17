@@ -193,6 +193,18 @@ IncomingTelegramMessage
 - `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. `/persona` показывает config-seeded catalog; неизвестные и malformed commands возвращают безопасную command error.
 - Aiogram adapter может создать response port, связанный с исходным `Message`; SDK types остаются только в adapter boundary.
 
+## Memory store и context builder
+
+`Confirmed`: следующая memory vertical добавляет SQLite canonical store для memory records и relationship state. Search index, embeddings, automatic extraction и promotion не входят в эту вертикаль.
+
+- `SQLiteMemoryStore` хранит `user_id` на каждой memory record и применяет ACL в SQL: active persona читает только `shared`, собственный `persona_private` и собственный `relationship`.
+- Persistence использует внутренний `persona.id`; config key остаётся routing/API identifier. Memory store регистрирует текущую config persona в additive `persona` table, не переписывая существующие `conversation.active_persona_key` и `persona_session.persona_key`.
+- `relationship` является отдельной canonical строкой на `(user_id, persona_id)` с `summary`, JSON state и optimistic `version`. Memory scope `relationship` ссылается на эту строку через owner-checked foreign key.
+- Shared record не имеет `persona_id` или `relationship_id`; private record требует `persona_id`; relationship record требует только `relationship_id`. SQLite `CHECK` и foreign keys отвергают остальные комбинации.
+- Контекст строится с bounded deterministic ordering (`updated_at DESC, id DESC`) и scope limits. Memory и relationship data помещаются в явно отмеченную untrusted data section; они не становятся system/identity instructions.
+- Пользовательские memory records создаются явно, могут быть обновлены и физически удалены. `provenance_session_id` остаётся nullable для ручных записей и может ссылаться на существующую persona session для автоматизированных записей.
+- Безопасный fallback при отсутствии memory store сохраняет текущий минимальный prompt; при включённом store ошибка чтения контекста не вызывает provider и возвращает generic error.
+
 ## Config-seeded personas
 
 `Confirmed`: persona catalog загружается при старте из TOML. Каждая запись имеет уникальные `key`, `display_name`, `identity_prompt` и положительный `identity_version`; один key объявлен `default_persona_key`.
@@ -219,6 +231,8 @@ IncomingTelegramMessage
 | Бэкап SQLite | Open | Нет автоматической внешней репликации; ручной локальный export только по явной команде |
 | Media/STT provider | Open | Text-first; media включается только после выбора provider и data-flow |
 | Форма управления памятью | Open | Slash commands, без dashboard или Mini App |
+| Политика soft-delete и обязательность provenance для автоматически извлечённых записей | Open | В текущей vertical физическое удаление; ручные записи могут быть без provenance |
+| Полнота relationship state и правила его автоматического обновления | Open | Хранить summary/state, изменять только явным store API |
 | Долговременная доступность public OAuth client ID Hermes | Open | Сохранять client ID конфигурируемым и не убирать API-key fallback |
 
 ## Порядок реализации
@@ -238,6 +252,8 @@ IncomingTelegramMessage
 - Чужой Telegram user ID не может вызвать ни agent run, ни callback side effect.
 - После переключения persona не видит transcript или private memory предыдущей persona.
 - Shared fact доступен всем personas, private fact недоступен другим personas даже при prompt injection.
+- Relationship fact доступен только owner и связанной persona, включая при прямом чтении SQLite store.
+- Повторное открытие SQLite data root сохраняет memory records, relationship version и delete semantics.
 - Entitlement failure может перейти на API key только при явно разрешённой политике и оставляет audit event.
 - Один scheduled reminder приводит к одной логической доставке при restart/retry.
 - В persistent store отсутствуют raw binary Telegram attachments и raw chain-of-thought.
