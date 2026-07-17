@@ -25,6 +25,10 @@ class PersonaCatalog:
         self._by_key = by_key
         self.default_persona_key = default_persona_key
 
+    @property
+    def personas(self) -> tuple[Persona, ...]:
+        return tuple(self._by_key.values())
+
     @classmethod
     def from_toml(cls, path: Path) -> "PersonaCatalog":
         with path.open("rb") as config_file:

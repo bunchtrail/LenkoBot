@@ -2,8 +2,16 @@ import asyncio
 from types import SimpleNamespace
 
 import lenkobot.aiogram_adapter as aiogram_adapter
-from lenkobot.aiogram_adapter import AiogramTelegramAdapter, create_dispatcher
+from lenkobot.aiogram_adapter import (
+    AiogramTelegramAdapter,
+    AiogramTelegramResponsePort,
+    create_dispatcher,
+)
 from lenkobot.telegram_router import IncomingTelegramMessage
+from lenkobot.telegram_presentation import (
+    TelegramResponse,
+    TelegramResponseKind,
+)
 
 
 class RecordingRouter:
@@ -86,6 +94,27 @@ def test_run_polling_uses_the_dispatchers_registered_update_types(monkeypatch):
     assert RecordingBot.instances[0].token == "123:token"
 
 
+def test_adapter_binds_aiogram_message_to_application_response_port():
+    service = RecordingApplicationService()
+    message = answering_telegram_message()
+    adapter = AiogramTelegramAdapter(
+        service,
+        response_port_factory=AiogramTelegramResponsePort,
+    )
+
+    asyncio.run(adapter.handle_message(message))
+
+    assert service.messages == [
+        IncomingTelegramMessage(
+            user_id=42,
+            chat_id=500,
+            chat_type="private",
+            text="hello",
+        )
+    ]
+    assert message.answers == ["done"]
+
+
 class RecordingDispatcher:
     def __init__(self):
         self.started_with = None
@@ -109,3 +138,29 @@ class RecordingBot:
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         return None
+
+
+class RecordingApplicationService:
+    def __init__(self):
+        self.messages = []
+
+    async def handle(self, message, response_port):
+        self.messages.append(message)
+        await response_port.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text="done",
+            )
+        )
+
+
+def answering_telegram_message():
+    message = telegram_message()
+    message.answers = []
+
+    async def answer(text):
+        message.answers.append(text)
+
+    message.answer = answer
+    return message

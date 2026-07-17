@@ -10,6 +10,9 @@
 - Первая xAI provider vertical ограничена non-streaming text Responses API. Credentials, transport и fallback policy разделены; default transport pinning разрешает только HTTPS host `api.x.ai`.
 - `oauth_then_api_key` требует explicit `EntitlementDenied`; undocumented raw `403` остаётся generic provider error и не включает платный fallback.
 - MVP использует `oauth_then_api_key`; fallback остаётся явной политикой, а не неявной реакцией на любой `401/403`.
+- Application service связывает private-only router с non-streaming provider через typed Telegram response port. `/persona` и обычный text turn обрабатываются до provider presentation разными ветками.
+- Response contract содержит explicit target `chat_id` и `status`/`notice`/`final`/`error` kinds. Fallback notice строится только по `XaiTextResponse.fallback_from`.
+- Blocking provider call выполняется через `asyncio.to_thread`, чтобы не блокировать aiogram event loop; SQLite routing остаётся в event-loop thread из-за thread-bound connection.
 - 17 июля 2026 OAuth device-code flow xAI завершился успешно. Единичный запрос `POST /v1/responses` для `grok-4.5` вернул `HTTP 200`.
 - 17 июля 2026 Terra research зафиксировал official REST contract: direct API-key request на `api.x.ai/v1/responses`, text в `output[]`, rate limit `429`; OAuth inference host и entitlement error schema остаются `Open`.
 - Проверка не сохраняла access token, refresh token или device code в проекте или persistent credential store.
@@ -22,6 +25,8 @@
 - Targeted review не нашёл компонента Hermes, который уже сейчас стоило бы перенести напрямую. Архитектурные приёмы и upstream tests полезнее как semantic reference; собственная узкая реализация соответствует KISS.
 - `aiogram==3.29.1` добавляет async Bot API transport и зависимости `aiohttp`; lockfile обновлён через `uv lock` на CPython 3.13.
 - xAI transport использует standard-library `urllib` через injected `JsonHttpClient`; новая runtime dependency для provider vertical не потребовалась.
+- До появления context builder допустим только минимальный prompt: identity активной persona плюс текущий user text. Transcript и memory не подмешиваются неявно.
+- Application service обязан проверять authorization до разрешения response port, поэтому unauthorized update не зависит от настроек presentation.
 
 ## Отклонения
 
@@ -29,11 +34,12 @@
 - Tool runtime завершает фоновые дочерние процессы после окончания команды. Для проверки применён двухфазный flow: device code удерживался в контексте запуска, а token запрашивался и использовался только во втором коротком процессе.
 - `OAuthCredentialSource` принимает access token через injected secure loader и не владеет persistence/device login/refresh. Это сохраняет DPAPI/Credential Manager boundary до отдельной credential vertical и исключает plaintext token store.
 - Automatic retry/backoff для `429` и `5xx` не входит в первую provider vertical; typed error сохраняется вызывающему application service.
+- Старый `TelegramRouter.handle()` и synchronous `ReplyPort` сохранены для совместимости первой вертикали; application service использует новый `TelegramRouter.route()` без reply/presentation side effect, при этом SQLite allocation остаётся его ожидаемым stateful поведением.
 
 ## Оставшиеся неизвестности
 
 - Какие конкретные Hermes fragments пройдут критерии минимальной выборки и будут иметь local owner, provenance и собственные тесты.
-- Следующая TDD-вертикаль после provider adapter: application service и Telegram command/response presentation.
+- Точная политика streaming и редактирования status messages остаётся Open; текущая vertical использует отдельные non-streaming Telegram responses.
 - Политика бэкапа SQLite, список предзаданных personas и media/STT provider остаются `Open` в `mvp-spec.md`.
 - Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью, несмотря на успешную проверку account entitlement.
 - Совместимость OAuth bearer с direct `api.x.ai/v1` и точная классификация entitlement denial требуют отдельного подтверждения. До него raw `403` не должен запускать платный API-key fallback.
@@ -60,3 +66,6 @@
 - Regression test для entitlement denial на OAuth credential refresh сначала воспроизвёл uncaught failure, затем подтвердил единый controlled fallback path.
 - Provider-specific suite завершился: `13 passed`; полный suite: `24 passed`.
 - `python -m compileall -q src tests`, `uv lock --check` и `git diff --check` завершились успешно после provider vertical.
+- Красный цикл application vertical начался с `ModuleNotFoundError` для новых application/presentation modules; затем targeted service suite завершился: `10 passed`.
+- Тесты application service подтверждают persona-aware prompt, typed status/final responses, explicit paid fallback notice, безопасную provider error, command switch без provider и private-only rejection.
+- Adapter integration suite после добавления per-message response port завершился: `6 passed`; старый mapping и список `allowed_updates` сохранены.

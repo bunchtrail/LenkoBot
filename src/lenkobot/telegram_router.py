@@ -157,11 +157,20 @@ class TelegramRouter:
         self._reply_port = reply_port
         self._persona_catalog = persona_catalog
 
-    def handle(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
-        if message.user_id != self._allowed_user_id or message.chat_type != "private":
+    def is_authorized(self, user_id: int, chat_type: str | None) -> bool:
+        return user_id == self._allowed_user_id and chat_type == "private"
+
+    def route(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
+        if not self.is_authorized(message.user_id, message.chat_type):
             return None
 
-        turn = self._store.route_message(message, self._persona_catalog)
+        return self._store.route_message(message, self._persona_catalog)
+
+    def handle(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
+        turn = self.route(message)
+        if turn is None:
+            return None
+
         self._reply_port.send(turn)
         return turn
 
@@ -172,7 +181,7 @@ class TelegramRouter:
         persona_key: str,
         chat_type: str | None = None,
     ) -> bool:
-        if user_id != self._allowed_user_id or chat_type != "private":
+        if not self.is_authorized(user_id, chat_type):
             return False
 
         persona = self._persona_catalog.get(persona_key)

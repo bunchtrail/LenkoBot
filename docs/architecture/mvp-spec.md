@@ -181,6 +181,18 @@ IncomingTelegramMessage
 - `oauth_then_api_key` требует обе configured credential sources и переключается только после typed `EntitlementDenied`. Generic `401`, raw `403`, `429`, network failure и `5xx` не запускают fallback.
 - Transport по умолчанию не угадывает entitlement по undocumented response body. Подтверждённый classifier может быть injected отдельно без изменения policy owner.
 
+## Application service и Telegram presentation
+
+`Confirmed`: application service связывает router и provider, а Telegram presentation получает только typed responses и не знает о credential или provider error details.
+
+- `TelegramApplicationService` сначала пропускает message через private-only authorization и router. Неавторизованные messages и commands, group chat или отсутствующий `chat_type` не создают state, не вызывают provider и не отправляют response.
+- Обычный text turn строит временный prompt из `identity_prompt` активной persona и текста пользователя. Memory, transcript context и tools подключаются отдельными вертикалями и не имитируются этим prompt.
+- Blocking provider call выполняется вне aiogram event loop. Provider error превращается в безопасный generic error response; raw body, bearer и внутренний error code пользователю не передаются.
+- `TelegramResponse` содержит explicit `chat_id`, `kind` (`status`, `notice`, `final`, `error`) и text. До provider отправляется короткий status, затем final assistant text.
+- Только typed `fallback_from` создаёт notice о переходе на API key и возможных расходах. Raw HTTP status или текст исключения не является основанием для такого notice.
+- `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. `/persona` показывает config-seeded catalog; неизвестные и malformed commands возвращают безопасную command error.
+- Aiogram adapter может создать response port, связанный с исходным `Message`; SDK types остаются только в adapter boundary.
+
 ## Config-seeded personas
 
 `Confirmed`: persona catalog загружается при старте из TOML. Каждая запись имеет уникальные `key`, `display_name`, `identity_prompt` и положительный `identity_version`; один key объявлен `default_persona_key`.
