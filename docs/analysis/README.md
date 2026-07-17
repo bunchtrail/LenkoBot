@@ -4,6 +4,7 @@
 
 - [Telegram gateway](telegram-gateway.md)
 - [xAI OAuth и Grok](xai-oauth.md)
+- [xAI Responses REST contract](xai-responses.md)
 - [Память, личности и проактивность](memory-personas.md)
 
 Отчёты сохранены без сокращения и смысловой переработки.

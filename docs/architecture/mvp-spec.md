@@ -72,6 +72,7 @@
 - `CredentialSource` возвращает bearer, expiry, base URL и source identity. Реализации: OAuth и `XAI_API_KEY`.
 - OAuth fallback не срабатывает для network errors, rate limits, произвольных `401/403` или ошибки модели. Он разрешён только для явно классифицированного entitlement failure.
 - OAuth client ID является конфигурируемым. Не считать public client ID Hermes принадлежащим LenkoBot или стабильной production dependency.
+- Official xAI docs не подтверждают, что OAuth bearer имеет тот же direct inference host и entitlement contract, что API key. Live OAuth proof подтверждает только текущий account; provider обязан сохранять source identity и не делать fallback по одному raw `403`.
 - `Assumed`: на Windows токены и Telegram secret хранятся через DPAPI/Credential Manager; в Docker/VPS секреты инжектируются внешним secret mechanism, а не записываются в SQLite.
 
 ## Минимальная модель данных
@@ -168,6 +169,17 @@ IncomingTelegramMessage
 - Отсутствующие user/chat/text отбрасываются до domain dispatch. Callback, inline, media и channel updates не регистрируются в этой вертикали.
 - `create_dispatcher` регистрирует только `message`; `run_polling` передаёт в Telegram API именно зарегистрированный список update types.
 - Adapter не запускает model/provider и не формирует искусственный ответ. `TelegramRouter` передаёт `RoutedTurn` в следующий internal port.
+
+## xAI provider boundary
+
+`Confirmed`: первая provider vertical реализует только non-streaming text request к Responses API. Она не подключается к Telegram renderer до появления отдельного application service.
+
+- `CredentialSource` возвращает bearer, expiry, base URL и source identity. API-key source использует direct `https://api.x.ai/v1`; OAuth source получает access token через injected secure loader и требует explicit base URL.
+- Bearer values не появляются в `repr`, errors или result objects. Transport принимает только HTTPS endpoint с host из explicit allowlist; default allowlist содержит `api.x.ai`.
+- Minimal request имеет `model` и string `input`. Final text собирается только из assistant `message` items и `output_text` parts; reasoning и неизвестные items пропускаются.
+- Provider result содержит credential source и `fallback_from`, чтобы presentation layer мог явно уведомить пользователя о переходе на платный API key.
+- `oauth_then_api_key` требует обе configured credential sources и переключается только после typed `EntitlementDenied`. Generic `401`, raw `403`, `429`, network failure и `5xx` не запускают fallback.
+- Transport по умолчанию не угадывает entitlement по undocumented response body. Подтверждённый classifier может быть injected отдельно без изменения policy owner.
 
 ## Config-seeded personas
 
