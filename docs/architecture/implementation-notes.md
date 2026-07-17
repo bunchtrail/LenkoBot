@@ -30,8 +30,12 @@
 - Device flow имеет отдельные `start` и `complete` операции: presentation получает verification data отдельно, а token state сохраняется только после успешного poll под refresh lock.
 - Device authorization, refresh и inference transport принимают bearer-token endpoints только на approved HTTPS host и default port; malformed external device payload превращается в controlled credential error без persistence.
 - Первый composition root использует два явных CLI workflow: `login` для user-mediated device authorization и `run` для Telegram polling. Автоматический browser launch не добавляется.
-- До появления подтверждённого entitlement classifier root использует только `oauth_only` и не читает `XAI_API_KEY`; это исключает неявные расходы и является обратимым сужением ранее запланированной fallback policy.
+- Подтверждённая целевая policy использует только `oauth_only` и не читает `XAI_API_KEY`; платный runtime fallback не добавляется даже после классификации entitlement errors.
 - Runtime config не содержит secrets: persona catalog, Telegram allowlist и OAuth client ID находятся в TOML; Telegram token приходит только через environment. Root владеет lifecycle двух thread-bound SQLite stores с общим `state.db`.
+- User подтвердил использование Hermes reference public client ID `b1a00492-073a-47ea-816f-4c329264a828` как local default без client secret; TOML override сохраняется, а ownership/stability client ID остаются `Open`.
+- Для memory command vertical подтверждён bounded contract: `/start` и `/help` показывают command index, `/remember <text>` создаёт shared `fact`, `/memories [page]` показывает owner-scoped active records всех scopes по 5 записей, `/forget <id>` выполняет owner-scoped physical delete; commands не вызывают provider.
+- 17 июля 2026 пользователь подтвердил post-MVP target `Personal production`: single-owner Telegram companion с web-панелью, durable session summary/memory, задачами/reminders, web knowledge и изолированным confirmed sandbox. Полный порядок фаз, data contracts, failure semantics, release gates и принятые риски находятся в [product-roadmap.md](product-roadmap.md).
+- Roadmap audit выровнял старую MVP-спецификацию с подтверждённой final boundary: текущий baseline не заявляет ещё отсутствующие reminders/transcripts/media, API-key fallback исключён, Phase 3 зависит от Phase 2 reset boundary, а Phase 6 явно владеет migration к canonical versioned persona catalog.
 
 ## Находки
 
@@ -61,12 +65,13 @@
 
 - Какие конкретные Hermes fragments пройдут критерии минимальной выборки и будут иметь local owner, provenance и собственные тесты.
 - Точная политика streaming и редактирования status messages остаётся Open; текущая vertical использует отдельные non-streaming Telegram responses.
-- Политика бэкапа SQLite, список предзаданных personas и media/STT provider остаются `Open` в `mvp-spec.md`.
-- Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью, несмотря на успешную проверку account entitlement.
+- Политика бэкапа SQLite и список предзаданных personas остаются `Open`; media/STT/TTS подтверждены как out of scope.
+- Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью; текущий local root использует его только как user-approved default и не трактует как owned production registration.
 - Совместимость OAuth bearer с direct `api.x.ai/v1` и точная классификация entitlement denial требуют отдельного подтверждения. До него raw `403` не должен запускать платный API-key fallback.
 - Portable Docker/VPS secret backend, token revocation, account switching и custom inference host остаются отдельными verticals; текущий Windows adapter не создаёт plaintext persistence.
-- Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая реализация должна сохранять только active records в context.
+- Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая command vertical использует физическое удаление и показывает только active records.
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
+- Phase 0 live smoke остаётся environment blocker: `TELEGRAM_BOT_TOKEN` отсутствует в process, User и Machine environment. Найденный работающий `lenkobot run` был запущен до memory-command vertical, поэтому не доказывает `/remember`, `/memories` и `/forget`; без secret его нельзя безопасно перезапустить из текущего процесса.
 
 ## Проверка
 
@@ -116,3 +121,8 @@
 - CLI help smoke успешно проверил `python -m lenkobot --help` и installed `lenkobot --help`; `config.example.toml` успешно проходит runtime parsing без secrets.
 - Независимый review composition root не нашёл code findings; одна stale documentation policy была выровнена с `oauth_only` contract.
 - После composition root vertical полный suite завершился: `87 passed`; `compileall`, `uv lock --check` и `git diff --check` прошли успешно.
+- После memory command vertical полный suite завершился: `95 passed`; `compileall`, `uv lock --check` и `git diff --check` прошли успешно.
+- Product-roadmap interview закрыл target decisions по sessions/transcripts, automatic memory, tasks/reminders, Telegram/web UX, knowledge/tools, sandbox policy, Linux deployment, data control и accepted operational risks.
+- Независимый consistency review [product-roadmap.md](product-roadmap.md) подтвердил порядок фаз, отсутствие cyclic dependencies и проверяемость completion gates; residual вопросы вынесены в explicit research gates. `git diff --check` завершился успешно.
+- Выполнение roadmap отслеживается в [product-roadmap-todo.md](product-roadmap-todo.md): phase checkbox закрывается только после implementation, exit gates и зафиксированных commit/test evidence.
+- Phase 0 local CI-equivalent verification: full suite `95 passed`, migration/security subset `59 passed`, `compileall`, `uv lock --check` и `git diff --check` успешны. `config.toml` добавлен в `.gitignore`; tracked credential-state artifacts отсутствуют. GitHub-hosted clean-checkout run фиксируется после push.

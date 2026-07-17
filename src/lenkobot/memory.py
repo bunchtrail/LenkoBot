@@ -252,6 +252,32 @@ class SQLiteMemoryStore:
         row = self._select_memory(memory_id, user_id)
         return None if row is None else self._memory_from_row(row)
 
+    def list_for_user(
+        self,
+        *,
+        user_id: int,
+        page: int = 1,
+        page_size: int = 5,
+    ) -> tuple[MemoryRecord, ...]:
+        if page < 1:
+            raise ValueError("memory page must be positive")
+        if page_size < 1:
+            raise ValueError("memory page size must be positive")
+        offset = (page - 1) * page_size
+        rows = self._connection.execute(
+            """
+            SELECT
+                id, user_id, scope, persona_id, relationship_id, kind, content,
+                provenance_session_id, status, created_at, updated_at
+            FROM memory
+            WHERE user_id = ? AND status = 'active'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, page_size, offset),
+        ).fetchall()
+        return tuple(self._memory_from_row(row) for row in rows)
+
     def update(
         self,
         memory_id: int,

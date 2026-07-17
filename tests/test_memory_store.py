@@ -273,3 +273,77 @@ def test_context_limits_use_deterministic_updated_order_across_scopes(tmp_path):
     assert contents(context.shared) == ("shared-new",)
     assert contents(context.persona_private) == ("private",)
     assert contents(context.relationship) == ()
+
+
+def test_owned_memory_listing_is_paginated_ordered_and_excludes_deleted_records(
+    tmp_path,
+):
+    store = SQLiteMemoryStore(tmp_path / "state.db")
+    records = tuple(
+        store.create(
+            NewMemory(
+                user_id=42,
+                scope=MemoryScope.SHARED,
+                kind="fact",
+                content=f"memory-{index}",
+                updated_at=f"2026-07-17T10:{index:02d}:00+00:00",
+            )
+        )
+        for index in range(6)
+    )
+    store.create(
+        NewMemory(
+            user_id=99,
+            scope=MemoryScope.SHARED,
+            kind="fact",
+            content="other-user",
+            updated_at="2026-07-17T12:00:00+00:00",
+        )
+    )
+    assert store.delete(records[2].id, user_id=42) is True
+
+    first_page = store.list_for_user(user_id=42, page=1, page_size=2)
+    second_page = store.list_for_user(user_id=42, page=2, page_size=2)
+
+    assert contents(first_page) == ("memory-5", "memory-4")
+    assert contents(second_page) == ("memory-3", "memory-1")
+
+
+def test_owned_memory_listing_includes_all_scopes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "state.db")
+    companion_id = store.register_persona(persona("companion"))
+    relationship = store.ensure_relationship(user_id=42, persona_id=companion_id)
+    store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.SHARED,
+            kind="fact",
+            content="shared",
+        )
+    )
+    store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.PERSONA_PRIVATE,
+            persona_id=companion_id,
+            kind="fact",
+            content="private",
+        )
+    )
+    store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.RELATIONSHIP,
+            relationship_id=relationship.id,
+            kind="fact",
+            content="relationship",
+        )
+    )
+
+    listed = store.list_for_user(user_id=42, page=1, page_size=5)
+
+    assert {record.scope for record in listed} == {
+        MemoryScope.SHARED,
+        MemoryScope.PERSONA_PRIVATE,
+        MemoryScope.RELATIONSHIP,
+    }

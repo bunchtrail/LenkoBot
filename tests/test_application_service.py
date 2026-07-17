@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
@@ -53,7 +55,14 @@ def build_catalog(tmp_path):
     return PersonaCatalog.from_toml(config_path)
 
 
-def build_service(tmp_path, provider, response_port, *, context_builder=None):
+def build_service(
+    tmp_path,
+    provider,
+    response_port,
+    *,
+    context_builder=None,
+    memory_store=None,
+):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
         allowed_user_id=42,
@@ -67,6 +76,7 @@ def build_service(tmp_path, provider, response_port, *, context_builder=None):
         provider=provider,
         response_port=response_port,
         context_builder=context_builder,
+        memory_store=memory_store,
     ), router
 
 
@@ -219,6 +229,106 @@ def test_invalid_or_unauthorized_commands_do_not_change_state_or_call_provider(t
     assert router.route(telegram_message("still companion")).persona_key == "companion"
     assert [item.kind for item in response_port.responses] == [TelegramResponseKind.ERROR]
     assert "unknown" not in response_port.responses[0].text
+
+
+@pytest.mark.parametrize("command", ("/start", "/help"))
+def test_start_and_help_return_command_index_without_provider_call(tmp_path, command):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Should not be called",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    service, _ = build_service(tmp_path, provider, response_port)
+
+    result = asyncio.run(service.handle(telegram_message(command)))
+
+    assert result is None
+    assert provider.prompts == []
+    assert response_port.responses[0].kind is TelegramResponseKind.FINAL
+    assert "/remember <text>" in response_port.responses[0].text
+    assert "/memories [page]" in response_port.responses[0].text
+    assert "/forget <id>" in response_port.responses[0].text
+
+
+def test_memory_commands_create_list_and_delete_only_owned_shared_records(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Should not be called",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        memory_store=memory_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("/remember User likes tea")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+    asyncio.run(service.handle(telegram_message("/memories")))
+    assert memory_store.delete(record.id, user_id=99) is False
+    asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
+
+    assert record.scope is MemoryScope.SHARED
+    assert record.kind == "fact"
+    assert record.content == "User likes tea"
+    assert response_port.responses[0].text == "Запомнил: User likes tea."
+    assert "[shared] User likes tea" in response_port.responses[1].text
+    assert response_port.responses[2].text == f"Удалено: запись {record.id}."
+    assert memory_store.get(record.id, user_id=42) is None
+    assert provider.prompts == []
+
+
+def test_memory_commands_validate_arguments_and_page(tmp_path):
+    provider = RecordingProvider()
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        memory_store=memory_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("/remember")))
+    asyncio.run(service.handle(telegram_message("/memories 0")))
+    asyncio.run(service.handle(telegram_message("/forget nope")))
+
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.ERROR,
+        TelegramResponseKind.ERROR,
+        TelegramResponseKind.ERROR,
+    ]
+    assert response_port.responses[0].text == "Формат команды: /remember <text>."
+    assert response_port.responses[1].text == "Номер страницы должен быть положительным."
+    assert response_port.responses[2].text == "Формат команды: /forget <id>."
+    assert provider.prompts == []
+
+
+def test_remember_rejects_text_longer_than_500_characters(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+
+    asyncio.run(service.handle(telegram_message(f"/remember {'x' * 501}")))
+
+    assert response_port.responses[0].kind is TelegramResponseKind.ERROR
+    assert response_port.responses[0].text == "Текст не должен быть длиннее 500 символов."
+    assert memory_store.memory_count() == 0
 
 
 def test_group_text_is_ignored_before_status_or_provider(tmp_path):

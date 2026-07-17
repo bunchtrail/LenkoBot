@@ -31,6 +31,7 @@ from .xai_provider import (
 
 _INFERENCE_BASE_URL = "https://api.x.ai/v1"
 _MODEL = "grok-4.5"
+_HERMES_REFERENCE_XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,8 +58,10 @@ def load_runtime_settings(
 
     telegram = data.get("telegram")
     oauth = data.get("oauth")
-    if not isinstance(telegram, dict) or not isinstance(oauth, dict):
-        raise ValueError("runtime configuration must contain telegram and oauth tables")
+    if not isinstance(telegram, dict):
+        raise ValueError("runtime configuration must contain a telegram table")
+    if oauth is not None and not isinstance(oauth, dict):
+        raise ValueError("runtime configuration oauth value must be a table")
 
     allowed_user_id = telegram.get("allowed_user_id")
     if (
@@ -68,7 +71,11 @@ def load_runtime_settings(
     ):
         raise ValueError("Telegram allowed_user_id must be a positive integer")
 
-    client_id = oauth.get("client_id")
+    client_id = (
+        oauth.get("client_id", _HERMES_REFERENCE_XAI_OAUTH_CLIENT_ID)
+        if isinstance(oauth, dict)
+        else _HERMES_REFERENCE_XAI_OAUTH_CLIENT_ID
+    )
     if not isinstance(client_id, str) or not client_id.strip():
         raise ValueError("OAuth client_id cannot be empty")
 
@@ -147,6 +154,7 @@ async def run_application(
         settings.persona_catalog,
         provider,
         context_builder=ContextBuilder(memory_store),
+        memory_store=memory_store,
     )
     try:
         await polling(

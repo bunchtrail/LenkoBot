@@ -6,9 +6,11 @@
 
 Внешняя проверка 17 июля 2026: OAuth device-code flow завершился успешно, а единичный запрос к `grok-4.5` вернул `HTTP 200`. Access token удерживался только в памяти verification process. Это подтверждает текущий entitlement проверенного account, но не владение или долговременную стабильность public OAuth client ID Hermes.
 
+Полный post-MVP маршрут от этой спецификации до `Personal production` описан в [product-roadmap.md](product-roadmap.md). Эта спецификация остаётся источником текущего MVP-контракта; roadmap явно помечает будущие расширения и их зависимости.
+
 ## Цель MVP
 
-Личный Telegram-бот для одного пользователя с переключаемыми персонами, общей и приватной памятью, краткой проекцией хода работы и надёжными явными напоминаниями. Первый релиз запускается локально на Windows и должен переноситься в Docker/VPS без смены модели данных.
+Личный text-first Telegram-бот для одного пользователя с переключаемыми персонами, общей и приватной памятью и краткой проекцией хода работы. Реализованный baseline запускается локально на Windows; sessions, reminders, web UI, tools и production deployment развиваются только через последовательные фазы [product-roadmap.md](product-roadmap.md).
 
 ## Подтверждённые решения
 
@@ -16,26 +18,24 @@
 |---|---|
 | Пользователь | Один заранее зарегистрированный Telegram user ID |
 | Исходный код | Standalone LenkoBot с минимальной выборкой узких компонентов Hermes под MIT; полный fork отсутствует |
-| Развёртывание | Локальный Windows first, portable data/config/secrets boundary для Docker/VPS |
+| Развёртывание | Локальный Windows baseline; Linux/Docker production является отдельной roadmap-фазой |
 | Telegram transport | `aiogram==3.29.1` через узкий adapter boundary; long polling в MVP, публичный webhook отсутствует |
-| Grok | Первый local composition root использует `oauth_only`; OAuth entitlement для `grok-4.5` подтверждён 17 июля 2026. API-key fallback добавляется только после подтверждённого entitlement classifier и с явным уведомлением о расходах |
+| Grok | Composition root использует только `oauth_only`; OAuth entitlement для `grok-4.5` подтверждён 17 июля 2026. Платный API-key fallback не входит в целевую границу |
 | Персоны | Несколько `persona_id` внутри одного profile, не несколько Hermes profiles |
-| Память | Shared facts/tasks + private memory/relationship активной персоны |
-| Transcripts | У каждой персоны отдельная session lane; персона не читает чужие transcripts |
-| Контроль пользователя | Пользователь видит, исправляет и удаляет все записи памяти |
-| Проактивность | Только созданные пользователем напоминания и явно согласованные follow-up |
+| Память | Shared facts + private memory/relationship активной персоны |
+| Sessions | У каждой персоны отдельная routing lane; durable raw transcript появляется в Phase 1 |
+| Контроль пользователя | Baseline позволяет создать, увидеть и удалить memory; edit/revisions/export/reset появляются в Phase 2 |
+| Проактивность | В baseline отсутствует; задачи и confirmed reminders появляются в Phase 3 |
 | Ход работы | Краткие статусы этапов и финальный итог; raw chain-of-thought не хранится и не отправляется |
 | Инструменты | Companion core: без shell, локальных файлов, browser automation, MCP и сторонних plugins |
-| Вложения | После обработки сохраняются результат и метаданные, но не исходные фото, voice или документы |
+| Вложения | Text-only; media/STT/TTS не входят в подтверждённую целевую границу |
 
 ## Наблюдаемое поведение
 
 1. Бот принимает сообщения только от configured Telegram user ID. Неавторизованные сообщения, callbacks и команды не создают сессию и не доходят до агента.
-2. Пользователь выбирает активную персону через `/persona <name>` или inline keyboard. Переключение атомарно меняет `active_persona_id` у conversation.
-3. Каждый ход собирает context из identity активной персоны, её отдельной session lane, shared memory, private memory персоны и её relationship с пользователем.
-4. Бот показывает безопасные статусы, например «Проверяю сведения» или «Готовлю ответ», и завершает ответом с коротким итогом выполненных действий.
-5. Пользователь создаёт, просматривает, отменяет и получает напоминания. Напоминание выполняется от имени создавшей его персоны, даже если активная персона позднее изменилась.
-6. Media может быть обработано только выбранными безопасными сервисами; после успешного извлечения результат становится текстом или явной memory record, а оригинал удаляется.
+2. Пользователь выбирает активную персону через `/persona <name>`. Inline keyboard появляется только в Phase 4. Переключение атомарно меняет active persona routing lane.
+3. Каждый ход собирает context из identity активной персоны, shared memory, private memory персоны и её relationship с пользователем. Durable recent transcript добавляется только в Phase 1.
+4. Бот показывает безопасные статусы, например «Проверяю сведения» или «Готовлю ответ», и завершает ответом с коротким итогом выполненных действий. `/start` и `/help` возвращают bounded command index.
 
 ## Границы и инварианты
 
@@ -59,19 +59,16 @@
 - Private memory никогда не становится shared автоматически. Повышение scope требует явного действия пользователя.
 - Пользователь может удалить memory record; удаление должно убрать её из canonical SQLite store и из любого перестраиваемого search index.
 
-### Напоминания и доставка
+### Будущие напоминания и доставка
 
-- Job хранит `persona_id`, `conversation_id`, timezone, schedule, execution policy и identity-version policy.
-- Worker claim и delivery разделены. Результат выполнения фиксируется до доставки, доставка проходит через durable `delivery_outbox` с bounded retry.
-- Нужна идемпотентность по `(job_id, scheduled_for)`: повтор worker не создаёт второе напоминание.
-- MVP использует explicit reminders. Quiet hours и произвольная инициативность не входят в scope, но поля policy не следует делать несовместимыми с их будущим добавлением.
+Reminder contract не является частью реализованного MVP baseline. Его подтверждённая модель, включая persona affinity, recurrence, quiet hours, durable outbox и idempotency, принадлежит Phase 3 product roadmap и не должна частично появляться раньше этой фазы.
 
 ### Provider и секреты
 
 - `ResponsesTransport` не знает о способе получения bearer token.
-- `CredentialSource` возвращает bearer, expiry, base URL и source identity. Реализации: OAuth и `XAI_API_KEY`.
-- OAuth fallback не срабатывает для network errors, rate limits, произвольных `401/403` или ошибки модели. Он разрешён только для явно классифицированного entitlement failure.
-- OAuth client ID является конфигурируемым. Не считать public client ID Hermes принадлежащим LenkoBot или стабильной production dependency.
+- `CredentialSource` возвращает bearer, expiry, base URL и source identity. Composition root принимает только OAuth credential source; наличие изолированного API-key adapter не разрешает runtime fallback.
+- Network errors, rate limits, `401/403` и ошибки модели всегда остаются typed OAuth/provider failures и не переключают приложение на платный credential source.
+- OAuth client ID является конфигурируемым. Для текущего local Windows root пользователь подтвердил reference public client ID Hermes как default; не считать его принадлежащим LenkoBot или стабильной production dependency, и сохранять `[oauth].client_id` как override.
 - Official xAI docs не подтверждают, что OAuth bearer имеет тот же direct inference host и entitlement contract, что API key. Live OAuth proof подтверждает только текущий account; provider обязан сохранять source identity и не делать fallback по одному raw `403`.
 - `Confirmed`: на Windows OAuth token state хранится в generic credential Windows Credential Manager под versioned target name; Telegram secret остаётся внешним secret configuration. В Docker/VPS секреты инжектируются внешним secret mechanism, а не записываются в SQLite.
 
@@ -202,9 +199,9 @@ IncomingTelegramMessage
 
 `Confirmed`: Windows-first запуск использует CLI entry point `lenkobot` с явными командами `login` и `run`.
 
-- `lenkobot login --config <path>` валидирует non-secret TOML config, использует OAuth client ID, показывает verification URL и user code, затем завершает device polling и сохраняет state через Credential Manager. Он не открывает браузер автоматически и не печатает device/access/refresh token.
+- `lenkobot login --config <path>` валидирует non-secret TOML config, использует configured OAuth client ID или approved local reference default, показывает verification URL и user code, затем завершает device polling и сохраняет state через Credential Manager. Он не открывает браузер автоматически и не печатает device/access/refresh token.
 - `lenkobot run --config <path> [--data-root <path>]` читает Telegram bot token только из `TELEGRAM_BOT_TOKEN`. Отсутствующий/пустой secret, OAuth state, Telegram allowlist или persona config останавливает запуск до создания `Bot` или polling.
-- `config.example.toml` определяет один TOML contract: root `default_persona_key` и `[[personas]]`, `[telegram].allowed_user_id` и `[oauth].client_id`. В конфиге нет Telegram token, API key, device code, access token или refresh token.
+- `config.example.toml` определяет один TOML contract: root `default_persona_key` и `[[personas]]`, `[telegram].allowed_user_id` и optional `[oauth].client_id` override. В конфиге нет Telegram token, API key, device code, access token или refresh token.
 - Default data root равен `<config parent>/data`; `--data-root` является явным override. Root передаёт один `<data root>/state.db` обоим SQLite stores и закрывает оба connection при normal или exceptional polling exit.
 - Current root использует fixed profile `default`, account-specific proof-tested OAuth inference URL `https://api.x.ai/v1` и model `grok-4.5`. Совместимость OAuth bearer с этим direct host остаётся `Open`; account switching, custom inference hosts и Docker/VPS secret backend остаются отдельными решениями.
 
@@ -216,13 +213,14 @@ IncomingTelegramMessage
 - Обычный text turn строит временный prompt из `identity_prompt` активной persona и текста пользователя. Memory, transcript context и tools подключаются отдельными вертикалями и не имитируются этим prompt.
 - Blocking provider call выполняется вне aiogram event loop. Provider error превращается в безопасный generic error response; raw body, bearer и внутренний error code пользователю не передаются.
 - `TelegramResponse` содержит explicit `chat_id`, `kind` (`status`, `notice`, `final`, `error`) и text. До provider отправляется короткий status, затем final assistant text.
-- Только typed `fallback_from` создаёт notice о переходе на API key и возможных расходах. Raw HTTP status или текст исключения не является основанием для такого notice.
-- `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. `/persona` показывает config-seeded catalog; неизвестные и malformed commands возвращают безопасную command error.
+- Legacy typed `fallback_from` остаётся изолированной transport metadata, но strict `oauth_only` composition root её не создаёт и не выполняет переход на API key. Raw HTTP status или текст исключения тем более не являются основанием для fallback.
+- `/start` и `/help` возвращают один и тот же command index и не вызывают provider. `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. `/persona` показывает config-seeded catalog; неизвестные и malformed commands возвращают безопасную command error.
+- `/remember <text>` создаёт owner-scoped shared memory с kind `fact`; пустой текст и текст длиннее 500 символов отклоняются. `/memories [page]` показывает active memory records текущего пользователя всех scopes по 5 записей на страницу в порядке `updated_at DESC, id DESC`. `/forget <id>` выполняет owner-scoped physical delete. Все эти команды проходят private-only authorization и не вызывают provider.
 - Aiogram adapter может создать response port, связанный с исходным `Message`; SDK types остаются только в adapter boundary.
 
 ## Memory store и context builder
 
-`Confirmed`: следующая memory vertical добавляет SQLite canonical store для memory records и relationship state. Search index, embeddings, automatic extraction и promotion не входят в эту вертикаль.
+`Confirmed`: memory vertical добавляет SQLite canonical store для memory records и relationship state, а command boundary предоставляет `/remember`, `/memories [page]` и `/forget`. Search index, embeddings, automatic extraction и promotion не входят в эту вертикаль.
 
 - `SQLiteMemoryStore` хранит `user_id` на каждой memory record и применяет ACL в SQL: active persona читает только `shared`, собственный `persona_private` и собственный `relationship`.
 - Persistence использует внутренний `persona.id`; config key остаётся routing/API identifier. Memory store регистрирует текущую config persona в additive `persona` table, не переписывая существующие `conversation.active_persona_key` и `persona_session.persona_key`.
@@ -256,23 +254,22 @@ IncomingTelegramMessage
 |---|---|---|
 | Список и создание personas | Open | Предзаданные personas в config; runtime creation позже |
 | Бэкап SQLite | Open | Нет автоматической внешней репликации; ручной локальный export только по явной команде |
-| Media/STT provider | Open | Text-first; media включается только после выбора provider и data-flow |
-| Форма управления памятью | Open | Slash commands, без dashboard или Mini App |
+| Media/STT provider | Confirmed out of scope | Целевая версия остаётся text-only |
+| Форма управления памятью | Confirmed | `/remember`, `/memories [page]`, `/forget`; без dashboard или Mini App |
 | Политика soft-delete и обязательность provenance для автоматически извлечённых записей | Open | В текущей vertical физическое удаление; ручные записи могут быть без provenance |
 | Полнота relationship state и правила его автоматического обновления | Open | Хранить summary/state, изменять только явным store API |
-| Долговременная доступность public OAuth client ID Hermes | Open | Сохранять client ID конфигурируемым и не убирать API-key fallback |
+| Долговременная доступность public OAuth client ID Hermes | Open | Сохранять client ID конфигурируемым; при недоступности fail closed без платного fallback |
 
 ## Порядок реализации
 
 1. Bootstrap standalone LenkoBot с reproducible local environment, отдельным LenkoBot data root и зафиксированным Python 3.13.
-2. Добавить migrations и SQLite entities для personas, scoped memory, tasks, reminders и outbox.
+2. Добавить migrations и SQLite entities для personas и scoped memory.
 3. Ввести early Telegram authorization и conversation/persona router, затем isolated persona sessions.
-4. Добавить context builder с SQL-enforced memory ACL и базовые `/persona`, memory и task commands.
-5. Вынести xAI credentials в `CredentialSource`, реализовать explicit OAuth-to-key fallback и проверки entitlement semantics.
+4. Добавить context builder с SQL-enforced memory ACL и базовые `/persona` и memory commands.
+5. Вынести xAI credentials в `CredentialSource`, подключить strict `oauth_only` root и проверить entitlement semantics.
 6. Проложить typed internal events в production Telegram renderer для статусов и финального итога.
-7. Реализовать reminders с claim, run history, outbox/retry и cancellation.
-8. Проверить сценарии авторизации, переключения personas, memory isolation, OAuth failure/fallback, reminder crash/retry и restart persistence.
-9. Добавить Docker/VPS packaging только после прохождения локального MVP.
+7. Проверить сценарии авторизации, переключения personas, memory isolation, OAuth failure и restart persistence.
+8. Продолжать sessions, reminders, web, tools и deployment только по product roadmap.
 
 ## Acceptance criteria
 
@@ -281,8 +278,6 @@ IncomingTelegramMessage
 - Shared fact доступен всем personas, private fact недоступен другим personas даже при prompt injection.
 - Relationship fact доступен только owner и связанной persona, включая при прямом чтении SQLite store.
 - Повторное открытие SQLite data root сохраняет memory records, relationship version и delete semantics.
-- Entitlement failure может перейти на API key только при явно разрешённой политике и оставляет audit event.
-- Один scheduled reminder приводит к одной логической доставке при restart/retry.
+- Entitlement failure завершается контролируемо и не переключается на API key.
 - В persistent store отсутствуют raw binary Telegram attachments и raw chain-of-thought.
-- Перенос data directory в Docker/VPS не меняет identifiers, migrations или memory semantics.
 - `login` не выводит OAuth token state, а `run` без OAuth state или Telegram secret не создаёт Telegram `Bot` и не начинает polling.

@@ -50,6 +50,20 @@ def test_load_runtime_settings_uses_config_parent_data_root_and_persona_catalog(
     assert settings.persona_catalog.default_persona_key == "lenko"
 
 
+def test_load_runtime_settings_uses_hermes_reference_client_when_oauth_override_is_missing(
+    tmp_path,
+):
+    config_path = write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").split("\n[oauth]\n", 1)[0],
+        encoding="utf-8",
+    )
+
+    settings = load_runtime_settings(config_path)
+
+    assert settings.oauth_client_id == "b1a00492-073a-47ea-816f-4c329264a828"
+
+
 def test_login_uses_configured_client_and_only_prints_user_visible_data(
     tmp_path,
     monkeypatch,

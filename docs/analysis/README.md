@@ -5,6 +5,8 @@
 - [Telegram gateway](telegram-gateway.md)
 - [xAI OAuth и Grok](xai-oauth.md)
 - [xAI Responses REST contract](xai-responses.md)
+- [OAuth secure backends](oauth-secure-backend.md)
+- [GitHub Actions Python and uv CI](github-actions-python-uv-ci-2026-07.md)
 - [Память, личности и проактивность](memory-personas.md)
 
 Отчёты сохранены без сокращения и смысловой переработки.
