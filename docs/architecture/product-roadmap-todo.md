@@ -78,8 +78,8 @@ Roadmap: [Phase 0](product-roadmap.md#phase-0-закрытие-текущего-
 - [x] Добавить в CI full test suite и compile check.
 - [x] Добавить в CI migration/security regression jobs, доступные на baseline.
 - [x] Записать результаты live smoke/blocker investigation в `implementation-notes.md`.
-- [ ] Создать отдельный feature commit текущей vertical.
-- [ ] Отправить feature commit в настроенный GitHub remote.
+- [x] Создать отдельный feature commit текущей vertical.
+- [x] Отправить feature commit в настроенный GitHub remote.
 
 ### Exit gates
 
@@ -92,16 +92,16 @@ Roadmap: [Phase 0](product-roadmap.md#phase-0-закрытие-текущего-
 - [x] `git diff --check` чистый.
 - [ ] Live-smoke gate закрыт реальной проверкой или явно принятым environment
   blocker.
-- [ ] CI проходит из clean checkout.
+- [x] CI проходит из clean checkout.
 - [x] В tracked files и image/build artifacts нет secrets.
 
 ### Evidence
 
-- Commit: `pending`
+- Commit: `c4d3fc3`
 - Tests: `95 passed`
 - Live smoke: `blocked — TELEGRAM_BOT_TOKEN отсутствует в process/User/Machine environment; running bot predates memory commands`
 - Blocker acceptance: `pending`
-- CI run: `pending`
+- CI run: `29588856781` — success
 
 ## Phase 1. Active session и transcript foundation
 
