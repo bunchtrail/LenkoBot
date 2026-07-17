@@ -135,3 +135,4 @@
 - Phase 1 red cycles начались с отсутствующего `lenkobot.session_store`, затем отдельно воспроизвели отсутствие transcript wiring в application/runtime и unsafe propagation persistence error.
 - Phase 1 targeted suite завершился: `39 passed`; полный suite: `107 passed`. `compileall`, `uv lock --check` и `git diff --check` успешны.
 - Read-only copy фактического `data/state.db` успешно мигрирована с schema v3 на v4: IDs `conversation=1`, `persona_session=1`, `persona=1` сохранены, concrete session rows до первого нового turn отсутствуют.
+- Phase 1 feature commit `37ddc26` отправлен в `origin/main`; GitHub Actions run `29590220267` завершил оба job успешно.
