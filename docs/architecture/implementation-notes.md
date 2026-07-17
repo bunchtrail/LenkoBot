@@ -36,6 +36,8 @@
 - Для memory command vertical подтверждён bounded contract: `/start` и `/help` показывают command index, `/remember <text>` создаёт shared `fact`, `/memories [page]` показывает owner-scoped active records всех scopes по 5 записей, `/forget <id>` выполняет owner-scoped physical delete; commands не вызывают provider.
 - 17 июля 2026 пользователь подтвердил post-MVP target `Personal production`: single-owner Telegram companion с web-панелью, durable session summary/memory, задачами/reminders, web knowledge и изолированным confirmed sandbox. Полный порядок фаз, data contracts, failure semantics, release gates и принятые риски находятся в [product-roadmap.md](product-roadmap.md).
 - Roadmap audit выровнял старую MVP-спецификацию с подтверждённой final boundary: текущий baseline не заявляет ещё отсутствующие reminders/transcripts/media, API-key fallback исключён, Phase 3 зависит от Phase 2 reset boundary, а Phase 6 явно владеет migration к canonical versioned persona catalog.
+- Phase 1 разделяет immutable `persona_session` routing lane и concrete generation-aware `session`; raw turns и redacted operational failures принадлежат новому `SQLiteSessionStore`, а `SessionFinalizer` пока существует только как Phase 2 port.
+- Phase 1 persistence order подтверждён как `user turn -> context/provider -> assistant turn -> delivery`; provider failure не создаёт assistant content, delivery failure не удаляет уже сохранённый assistant result.
 
 ## Находки
 
@@ -50,6 +52,7 @@
 - В ходе finding-unknowns подтверждено, что текущие `conversation` и `persona_session` не содержат owner/profile columns; migration этой схемы в memory vertical не выполняется, а nullable provenance ID остаётся без FK до общей schema migration.
 - Для ручных memory records выбран nullable `provenance_session_id`; физическое удаление оставлено минимальной delete semantics до решения о retention/audit.
 - Существующий `state.db` мог быть создан conversation store, memory store или обоими и имеет `user_version = 0`. Migration owner обязан распознать эту поддерживаемую историю через idempotent historical DDL, а не переписывать таблицы.
+- Фактический local `data/state.db` перед Phase 1 имел `user_version = 3` и существующие IDs `conversation=1`, `persona=1`, `persona_session=1`; additive migration создаёт новые session tables без backfill/rewrite этих IDs.
 
 ## Отклонения
 
@@ -60,6 +63,8 @@
 - Старый `TelegramRouter.handle()` и synchronous `ReplyPort` сохранены для совместимости первой вертикали; application service использует новый `TelegramRouter.route()` без reply/presentation side effect, при этом SQLite allocation остаётся его ожидаемым stateful поведением.
 - Вместо немедленной миграции `conversation.active_persona_key` на `active_persona_id` memory store добавляет собственный persona registry и разрешает key в ID при построении контекста. Это сохраняет существующие session identifiers и ограничивает blast radius вертикали.
 - Stores продолжают открывать отдельные sqlite connections вместо общего process-wide connection. Это сохраняет стандартную thread-bound модель `sqlite3`; общий lifecycle соединений будет собран будущим composition root.
+- Phase 1 не добавляет owner FK в исторический `conversation`: static Telegram authorization знает owner только в runtime, поэтому неподтверждаемый migration backfill был бы ложным. Owner хранится на concrete `session`; multi-surface conversation ownership остаётся отдельной migration до web release.
+- Локальная Phase 1 начата при незакрытом live-smoke gate Phase 0. Это обратимое отклонение допустимо только потому, что blocker внешний, а schema/TDD work не зависит от Telegram secret; Phase 0 не помечена complete.
 
 ## Оставшиеся неизвестности
 
@@ -127,3 +132,6 @@
 - Выполнение roadmap отслеживается в [product-roadmap-todo.md](product-roadmap-todo.md): phase checkbox закрывается только после implementation, exit gates и зафиксированных commit/test evidence.
 - Phase 0 local CI-equivalent verification: full suite `95 passed`, migration/security subset `59 passed`, `compileall`, `uv lock --check` и `git diff --check` успешны. `config.toml` добавлен в `.gitignore`; tracked credential-state artifacts отсутствуют. GitHub-hosted clean-checkout run фиксируется после push.
 - Feature commit `c4d3fc3` отправлен в `origin/main`; GitHub Actions run `29588856781` завершил оба job успешно на clean hosted checkout. Phase 0 остаётся `in progress` только из-за непринятого live-smoke blocker.
+- Phase 1 red cycles начались с отсутствующего `lenkobot.session_store`, затем отдельно воспроизвели отсутствие transcript wiring в application/runtime и unsafe propagation persistence error.
+- Phase 1 targeted suite завершился: `39 passed`; полный suite: `107 passed`. `compileall`, `uv lock --check` и `git diff --check` успешны.
+- Read-only copy фактического `data/state.db` успешно мигрирована с schema v3 на v4: IDs `conversation=1`, `persona_session=1`, `persona=1` сохранены, concrete session rows до первого нового turn отсутствуют.

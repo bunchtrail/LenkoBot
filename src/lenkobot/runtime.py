@@ -16,6 +16,7 @@ from .oauth_credentials import (
     XaiOAuthDeviceClient,
 )
 from .personas import PersonaCatalog
+from .session_store import SQLiteSessionStore
 from .telegram_router import RoutedTurn, SQLiteConversationStore, TelegramRouter
 from .xai_provider import (
     CredentialPolicy,
@@ -142,6 +143,12 @@ async def run_application(
     except Exception:
         conversation_store.close()
         raise
+    try:
+        session_store = SQLiteSessionStore(database_path)
+    except Exception:
+        conversation_store.close()
+        memory_store.close()
+        raise
 
     router = TelegramRouter(
         settings.allowed_user_id,
@@ -153,8 +160,12 @@ async def run_application(
         router,
         settings.persona_catalog,
         provider,
-        context_builder=ContextBuilder(memory_store),
+        context_builder=ContextBuilder(
+            memory_store,
+            transcript_store=session_store,
+        ),
         memory_store=memory_store,
+        session_store=session_store,
     )
     try:
         await polling(
@@ -165,6 +176,7 @@ async def run_application(
     finally:
         conversation_store.close()
         memory_store.close()
+        session_store.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

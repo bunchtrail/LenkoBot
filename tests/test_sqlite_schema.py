@@ -82,6 +82,15 @@ def test_unversioned_state_database_is_migrated_without_losing_session_data(tmp_
     conversation = connection.execute(
         "SELECT id, active_persona_key, version FROM conversation WHERE chat_id = 500"
     ).fetchone()
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    legacy_lane = connection.execute(
+        "SELECT id, conversation_id FROM persona_session WHERE id = 11"
+    ).fetchone()
     connection.close()
 
     assert turn.conversation_id == 7
@@ -90,6 +99,13 @@ def test_unversioned_state_database_is_migrated_without_losing_session_data(tmp_
     assert record.content == "kept"
     assert version == CURRENT_SCHEMA_VERSION
     assert tuple(conversation) == (7, "companion", 1)
+    assert tuple(legacy_lane) == (11, 7)
+    assert {
+        "user_profile",
+        "session",
+        "transcript_turn",
+        "transcript_failure",
+    } <= tables
 
 
 def test_newer_schema_version_is_rejected_without_modifying_database(tmp_path):
@@ -110,6 +126,51 @@ def test_newer_schema_version_is_rejected_without_modifying_database(tmp_path):
         CURRENT_SCHEMA_VERSION + 1
     )
     check.close()
+
+
+def test_version_three_database_adds_session_schema_without_rewriting_lane_ids(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE conversation (
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            active_persona_key TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(platform, chat_id)
+        );
+        CREATE TABLE persona_session (
+            id INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversation(id),
+            persona_key TEXT NOT NULL,
+            identity_version INTEGER NOT NULL,
+            UNIQUE(conversation_id, persona_key, identity_version)
+        );
+        INSERT INTO conversation (
+            id, platform, chat_id, active_persona_key, version
+        ) VALUES (7, 'telegram', 500, 'companion', 3);
+        INSERT INTO persona_session (
+            id, conversation_id, persona_key, identity_version
+        ) VALUES (11, 7, 'companion', 1);
+        PRAGMA user_version = 3;
+        """
+    )
+    connection.close()
+
+    migrated = open_state_database(database_path)
+
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    assert tuple(
+        migrated.execute(
+            "SELECT id, conversation_id FROM persona_session WHERE id = 11"
+        ).fetchone()
+    ) == (11, 7)
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM session"
+    ).fetchone()[0] == 0
+    migrated.close()
 
 
 def test_failed_migration_rolls_back_ddl_and_does_not_advance_version(tmp_path):

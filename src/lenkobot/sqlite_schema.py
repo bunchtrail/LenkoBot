@@ -122,10 +122,89 @@ def _add_conversation_version(connection: sqlite3.Connection) -> None:
         )
 
 
+def _create_session_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_profile (
+            user_id INTEGER PRIMARY KEY,
+            timezone TEXT NOT NULL DEFAULT 'UTC'
+                CHECK(length(trim(timezone)) > 0),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session (
+            id INTEGER PRIMARY KEY,
+            persona_session_id INTEGER NOT NULL
+                REFERENCES persona_session(id) ON DELETE CASCADE,
+            owner_user_id INTEGER NOT NULL
+                REFERENCES user_profile(user_id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active', 'closed')),
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            UNIQUE(persona_session_id, generation),
+            CHECK(
+                (status = 'active' AND closed_at IS NULL)
+                OR (status = 'closed' AND closed_at IS NOT NULL)
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS session_one_active_lane_idx
+            ON session(persona_session_id)
+            WHERE status = 'active'
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transcript_turn (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+            provider_response_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, sequence),
+            UNIQUE(id, session_id),
+            CHECK(role = 'assistant' OR provider_response_id IS NULL)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS transcript_turn_session_sequence_idx
+            ON transcript_turn(session_id, sequence DESC)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transcript_failure (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            related_turn_id INTEGER NOT NULL,
+            stage TEXT NOT NULL CHECK(stage IN ('provider', 'delivery')),
+            error_kind TEXT NOT NULL
+                CHECK(length(trim(error_kind)) > 0 AND length(error_kind) <= 100),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (related_turn_id, session_id)
+                REFERENCES transcript_turn(id, session_id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_conversation_schema,
     _create_memory_schema,
     _add_conversation_version,
+    _create_session_schema,
 )
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 

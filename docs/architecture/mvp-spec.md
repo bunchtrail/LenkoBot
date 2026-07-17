@@ -47,8 +47,13 @@
 
 ### Identity и sessions
 
-- Ключ persona session: `(conversation_id, persona_id)`.
-- Любое переключение persona выбирает или создаёт её собственную `session_id`; transcript другой identity не возобновляется.
+- `persona_session` является неизменяемой routing lane по conversation, persona key и identity version; её ID не является ID конкретного разговора.
+- Конкретный `session` имеет generation и status `active|closed`. В Phase 1 для каждой persona lane существует не более одной active generation; автоматического close/rollover нет.
+- Любое переключение persona выбирает её собственную routing lane и active concrete session. Transcript другой identity не читается ни по `chat_id`, ни по произвольному session ID.
+- `user_profile` создаётся лениво только после static owner authorization. Concrete session хранит `owner_user_id`; исторический `conversation` не получает неподтверждаемый backfill owner из runtime config.
+- Авторизованный raw user turn сохраняется до context/provider work. Успешный assistant result сохраняется до Telegram delivery; controlled provider/delivery failures лежат отдельно от content и не содержат raw errors.
+- Recent transcript ограничен восемью turn, 6000 символами суммарно и 2000 на turn; current turn и memory/relationship payload также имеют фиксированные char limits. Все transcript/memory sections помечены как untrusted data.
+- `SessionFinalizer` определён только как port для Phase 2. Phase 1 не публикует close/new command, не удаляет raw turns и не меняет active status скрыто.
 - Prompt cache привязан к `persona_id` и `identity_version`. Изменение identity инвалидирует только соответствующую persona session.
 - Общий Hermes `SOUL.md`, runner-global ephemeral prompt и profile multiplex не используются как механизм переключения персонажей.
 
@@ -85,7 +90,24 @@ conversation(
 )
 
 persona_session(
-  conversation_id, persona_id, session_id, identity_version, last_active_at
+  id, conversation_id, persona_key, identity_version
+)
+
+user_profile(
+  user_id, timezone, created_at
+)
+
+session(
+  id, persona_session_id, owner_user_id, generation,
+  status, opened_at, closed_at
+)
+
+transcript_turn(
+  id, session_id, sequence, role, content, provider_response_id, created_at
+)
+
+transcript_failure(
+  id, session_id, related_turn_id, stage, error_kind, created_at
 )
 
 memory(
@@ -97,22 +119,6 @@ relationship(
   id, user_id, persona_id, summary, state_json, version, updated_at
 )
 
-task(
-  id, scope, owner_persona_id?, status, due_at, payload_json
-)
-
-reminder_job(
-  id, persona_id, conversation_id, task_id?, schedule_json, timezone,
-  prompt, state, next_run_at
-)
-
-reminder_run(
-  id, job_id, scheduled_for, status, claim_token, attempt, output_ref, error
-)
-
-delivery_outbox(
-  id, run_id, target_json, status, attempt, next_attempt_at, error
-)
 ```
 
 `conversation.version` используется для optimistic concurrency при одновременных Telegram updates. SQLite является canonical store; любой embedding/vector index можно пересобрать из него и не использовать как source of truth.
@@ -140,11 +146,9 @@ Telegram long polling
   -> Telegram status/final renderer
 
 SQLite canonical store
-  <- memory/task/reminder services
-  <- persona session registry
-
-Reminder scheduler
-  -> run claim -> execution -> delivery outbox -> Telegram sender
+  <- scoped memory service
+  <- persona routing lane registry
+  <- active session/transcript service
 ```
 
 Hermes остаётся reference implementation, а не runtime dependency. Выборка допустима только для узких, изолированных и тестируемых фрагментов по [policy использования upstream](upstream-use.md). Нельзя переносить целиком `/personality`, profile multiplex, `gateway/run.py`, текущий cron store или memory plugins как границы persona context: их ограничения описаны в [аудите памяти](../analysis/memory-personas.md).

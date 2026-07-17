@@ -109,34 +109,34 @@ Roadmap: [Phase 1](product-roadmap.md#phase-1-active-session-и-transcript-found
 
 ### Работы
 
-- [ ] Обновить `mvp-spec.md` для durable active transcript contract.
-- [ ] Добавить failing migration/model tests для `user_profile`.
-- [ ] Добавить failing migration/model tests для `transcript_turn`.
-- [ ] Реализовать active session status без автоматического close.
-- [ ] Сохранять user turn до provider call.
-- [ ] Сохранять assistant result через контролируемый response path.
-- [ ] Фиксировать delivery failure отдельно от assistant content.
-- [ ] Добавить bounded recent-window context активной session.
-- [ ] Сохранить существующий scoped-memory context.
-- [ ] Определить `SessionFinalizer` port без публикации close/new command.
-- [ ] Добавить failure/retry states для будущей finalization.
-- [ ] Обновить implementation notes и migration fixtures.
+- [x] Обновить `mvp-spec.md` для durable active transcript contract.
+- [x] Добавить failing migration/model tests для `user_profile`.
+- [x] Добавить failing migration/model tests для `transcript_turn`.
+- [x] Реализовать active session status без автоматического close.
+- [x] Сохранять user turn до provider call.
+- [x] Сохранять assistant result через контролируемый response path.
+- [x] Фиксировать delivery failure отдельно от assistant content.
+- [x] Добавить bounded recent-window context активной session.
+- [x] Сохранить существующий scoped-memory context.
+- [x] Определить `SessionFinalizer` port без публикации close/new command.
+- [x] Добавить failure/retry states для будущей finalization.
+- [x] Обновить implementation notes и migration fixtures.
 
 ### Exit gates
 
-- [ ] Restart восстанавливает active session и raw turns.
-- [ ] Provider/delivery failure оставляет согласованную history.
-- [ ] Persona не читает transcript lane другой persona.
-- [ ] Prompt budget детерминирован и ограничен.
-- [ ] Migration существующей `state.db` сохраняет identifiers.
-- [ ] Старый runtime contract не получает скрытый session close.
+- [x] Restart восстанавливает active session и raw turns.
+- [x] Provider/delivery failure оставляет согласованную history.
+- [x] Persona не читает transcript lane другой persona.
+- [x] Prompt budget детерминирован и ограничен.
+- [x] Migration существующей `state.db` сохраняет identifiers.
+- [x] Старый runtime contract не получает скрытый session close.
 
 ### Evidence
 
 - Commit: `pending`
-- Targeted tests: `pending`
-- Full suite: `pending`
-- Migration fixtures: `pending`
+- Targeted tests: `39 passed`
+- Full suite: `107 passed`
+- Migration fixtures: unversioned legacy and explicit schema v3 preserve IDs
 
 ## Phase 2. Session finalization, Memory v2 и контроль данных
 

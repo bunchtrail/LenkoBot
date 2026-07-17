@@ -192,6 +192,16 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
         def close(self):
             type(self).closed += 1
 
+    class RecordingSessionStore:
+        paths = []
+        closed = 0
+
+        def __init__(self, database_path, **kwargs):
+            self.paths.append(database_path)
+
+        def close(self):
+            type(self).closed += 1
+
     observed = {}
 
     async def polling(bot_token, handler, *, response_port_factory):
@@ -205,6 +215,7 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
     monkeypatch.setattr(runtime, "SQLiteConversationStore", RecordingConversationStore)
     monkeypatch.setattr(runtime, "SQLiteMemoryStore", RecordingMemoryStore)
+    monkeypatch.setattr(runtime, "SQLiteSessionStore", RecordingSessionStore)
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     settings = load_runtime_settings(write_config(tmp_path))
 
@@ -217,8 +228,10 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     expected_database_path = tmp_path / "data" / "state.db"
     assert RecordingConversationStore.paths == [expected_database_path]
     assert RecordingMemoryStore.paths == [expected_database_path]
+    assert RecordingSessionStore.paths == [expected_database_path]
     assert RecordingConversationStore.closed == 1
     assert RecordingMemoryStore.closed == 1
+    assert RecordingSessionStore.closed == 1
     assert observed["bot_token"] == "telegram-secret"
     assert isinstance(observed["handler"], TelegramApplicationService)
     assert observed["response_port_factory"] is AiogramTelegramResponsePort

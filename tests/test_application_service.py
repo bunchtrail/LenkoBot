@@ -6,6 +6,7 @@ from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
 from lenkobot.personas import PersonaCatalog
+from lenkobot.session_store import FailureStage, SQLiteSessionStore
 from lenkobot.telegram_presentation import TelegramResponseKind
 from lenkobot.telegram_router import IncomingTelegramMessage, SQLiteConversationStore, TelegramRouter
 from lenkobot.xai_provider import ProviderRequestError, XaiTextResponse
@@ -30,6 +31,18 @@ class RecordingProvider:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class FailingFinalResponsePort(RecordingResponsePort):
+    async def send(self, response):
+        if response.kind is TelegramResponseKind.FINAL:
+            raise RuntimeError("telegram transport details")
+        await super().send(response)
+
+
+class FailingSessionStore:
+    def begin_user_turn(self, **kwargs):
+        raise RuntimeError("database-secret")
 
 
 def build_catalog(tmp_path):
@@ -62,6 +75,7 @@ def build_service(
     *,
     context_builder=None,
     memory_store=None,
+    session_store=None,
 ):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
@@ -77,6 +91,7 @@ def build_service(
         response_port=response_port,
         context_builder=context_builder,
         memory_store=memory_store,
+        session_store=session_store,
     ), router
 
 
@@ -158,6 +173,104 @@ def test_provider_failure_returns_safe_error_without_internal_details(tmp_path):
     assert response_port.responses[-1].text == "Не удалось подготовить ответ. Попробуйте ещё раз."
     assert "do-not-show" not in response_port.responses[-1].text
     assert "server_error" not in response_port.responses[-1].text
+
+
+def test_provider_failure_keeps_user_turn_and_redacted_failure_record(tmp_path):
+    database_path = tmp_path / "state.db"
+    provider = RecordingProvider(
+        error=ProviderRequestError(
+            "request failed",
+            status=500,
+            code="server_error",
+            raw_body='{"token":"do-not-store"}',
+            headers={},
+        )
+    )
+    response_port = RecordingResponsePort()
+    session_store = SQLiteSessionStore(database_path)
+    service, router = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        session_store=session_store,
+    )
+
+    result = asyncio.run(service.handle(telegram_message("Persist me")))
+    lane = router.route(telegram_message("inspect"))
+    active = session_store.ensure_active_session(
+        user_id=42,
+        persona_session_id=lane.session_id,
+    )
+
+    assert result is None
+    assert [turn.content for turn in session_store.list_turns(session_id=active.id, user_id=42)] == [
+        "Persist me"
+    ]
+    assert [
+        (failure.stage, failure.error_kind)
+        for failure in session_store.list_failures(session_id=active.id, user_id=42)
+    ] == [(FailureStage.PROVIDER, "provider_request_failed")]
+
+
+def test_transcript_persistence_failure_is_safe_and_skips_provider(tmp_path):
+    provider = RecordingProvider()
+    response_port = RecordingResponsePort()
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        session_store=FailingSessionStore(),
+    )
+
+    result = asyncio.run(service.handle(telegram_message("Do not lose me")))
+
+    assert result is None
+    assert provider.prompts == []
+    assert [(response.kind, response.text) for response in response_port.responses] == [
+        (
+            TelegramResponseKind.ERROR,
+            "Не удалось сохранить сообщение. Попробуйте ещё раз.",
+        )
+    ]
+    assert "database-secret" not in response_port.responses[0].text
+
+
+def test_delivery_failure_keeps_assistant_turn_and_separate_failure(tmp_path):
+    database_path = tmp_path / "state.db"
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Durable answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = FailingFinalResponsePort()
+    session_store = SQLiteSessionStore(database_path)
+    service, router = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        session_store=session_store,
+    )
+
+    with pytest.raises(RuntimeError, match="telegram transport"):
+        asyncio.run(service.handle(telegram_message("Question")))
+    lane = router.route(telegram_message("inspect"))
+    active = session_store.ensure_active_session(
+        user_id=42,
+        persona_session_id=lane.session_id,
+    )
+
+    turns = session_store.list_turns(session_id=active.id, user_id=42)
+    failures = session_store.list_failures(session_id=active.id, user_id=42)
+    assert [(turn.role, turn.content) for turn in turns] == [
+        ("user", "Question"),
+        ("assistant", "Durable answer"),
+    ]
+    assert [(failure.stage, failure.error_kind) for failure in failures] == [
+        (FailureStage.DELIVERY, "telegram_delivery_failed")
+    ]
 
 
 def test_persona_command_switches_lane_without_provider_call(tmp_path):
@@ -420,6 +533,41 @@ def test_application_service_builds_provider_prompt_with_scoped_memory(tmp_path)
     assert provider.prompts[0].endswith("User message:\nExplain it")
 
 
+def test_application_service_builds_next_prompt_from_durable_recent_transcript(tmp_path):
+    database_path = tmp_path / "state.db"
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="First durable answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(database_path)
+    session_store = SQLiteSessionStore(database_path)
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        context_builder=ContextBuilder(
+            memory_store,
+            transcript_store=session_store,
+        ),
+        session_store=session_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("First durable question")))
+    asyncio.run(service.handle(telegram_message("Second question")))
+
+    assert len(provider.prompts) == 2
+    assert "UNTRUSTED ACTIVE SESSION TRANSCRIPT" in provider.prompts[1]
+    assert "First durable question" in provider.prompts[1]
+    assert "First durable answer" in provider.prompts[1]
+    assert provider.prompts[1].count("Second question") == 1
+    assert provider.prompts[1].endswith("User message:\nSecond question")
+
+
 def test_unauthorized_input_is_rejected_before_context_builder(tmp_path):
     provider = RecordingProvider(
         result=XaiTextResponse(
@@ -446,6 +594,22 @@ def test_unauthorized_input_is_rejected_before_context_builder(tmp_path):
     assert context_builder.calls == []
     assert provider.prompts == []
     assert response_port.responses == []
+
+
+def test_unauthorized_input_creates_no_profile_session_or_transcript(tmp_path):
+    session_store = SQLiteSessionStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        RecordingResponsePort(),
+        session_store=session_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("No access", user_id=99, chat_id=501)))
+
+    assert session_store.profile_count() == 0
+    assert session_store.session_count() == 0
+    assert session_store.turn_count() == 0
 
 
 def test_context_failure_returns_safe_error_without_calling_provider(tmp_path):

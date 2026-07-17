@@ -3,6 +3,7 @@ from typing import Protocol
 
 from .memory import MemoryRecord, MemoryScope, NewMemory
 from .personas import Persona, PersonaCatalog
+from .session_store import FailureStage, TranscriptFailure, TranscriptTurn
 from .telegram_presentation import (
     TelegramCommand,
     TelegramResponse,
@@ -19,7 +20,15 @@ class TextProvider(Protocol):
 
 
 class TurnContextBuilder(Protocol):
-    def build(self, *, user_id: int, persona: Persona, turn: RoutedTurn) -> str: ...
+    def build(
+        self,
+        *,
+        user_id: int,
+        persona: Persona,
+        turn: RoutedTurn,
+        active_session_id: int | None = None,
+        current_transcript_turn_id: int | None = None,
+    ) -> str: ...
 
 
 class MemoryCommandStore(Protocol):
@@ -34,6 +43,33 @@ class MemoryCommandStore(Protocol):
     ) -> tuple[MemoryRecord, ...]: ...
 
     def delete(self, memory_id: int, *, user_id: int) -> bool: ...
+
+
+class TranscriptStore(Protocol):
+    def begin_user_turn(
+        self,
+        *,
+        user_id: int,
+        persona_session_id: int,
+        content: str,
+    ) -> TranscriptTurn: ...
+
+    def append_assistant_turn(
+        self,
+        *,
+        session_id: int,
+        content: str,
+        provider_response_id: str | None,
+    ) -> TranscriptTurn: ...
+
+    def record_failure(
+        self,
+        *,
+        session_id: int,
+        related_turn_id: int,
+        stage: FailureStage,
+        error_kind: str,
+    ) -> TranscriptFailure: ...
 
 
 _MEMORY_PAGE_SIZE = 5
@@ -57,6 +93,7 @@ class TelegramApplicationService:
         response_port: TelegramResponsePort | None = None,
         context_builder: TurnContextBuilder | None = None,
         memory_store: MemoryCommandStore | None = None,
+        session_store: TranscriptStore | None = None,
     ) -> None:
         self._router = router
         self._persona_catalog = persona_catalog
@@ -64,6 +101,7 @@ class TelegramApplicationService:
         self._response_port = response_port
         self._context_builder = context_builder
         self._memory_store = memory_store
+        self._session_store = session_store
 
     async def handle(
         self,
@@ -86,13 +124,39 @@ class TelegramApplicationService:
         if persona is None:
             raise ValueError("routed persona is not present in catalog")
 
-        await presenter.send(
-            TelegramResponse(
-                chat_id=turn.chat_id,
-                kind=TelegramResponseKind.STATUS,
-                text="Готовлю ответ",
+        user_turn = None
+        if self._session_store is not None:
+            try:
+                user_turn = self._session_store.begin_user_turn(
+                    user_id=message.user_id,
+                    persona_session_id=turn.session_id,
+                    content=turn.text,
+                )
+            except Exception:
+                await presenter.send(
+                    TelegramResponse(
+                        chat_id=turn.chat_id,
+                        kind=TelegramResponseKind.ERROR,
+                        text="Не удалось сохранить сообщение. Попробуйте ещё раз.",
+                    )
+                )
+                return None
+        try:
+            await presenter.send(
+                TelegramResponse(
+                    chat_id=turn.chat_id,
+                    kind=TelegramResponseKind.STATUS,
+                    text="Готовлю ответ",
+                )
             )
-        )
+        except Exception:
+            self._record_transcript_failure(
+                user_turn,
+                FailureStage.DELIVERY,
+                "telegram_status_delivery_failed",
+            )
+            raise
+
         try:
             prompt = self._build_prompt(persona, turn)
             if self._context_builder is not None:
@@ -100,40 +164,99 @@ class TelegramApplicationService:
                     user_id=message.user_id,
                     persona=persona,
                     turn=turn,
+                    active_session_id=(
+                        None if user_turn is None else user_turn.session_id
+                    ),
+                    current_transcript_turn_id=(
+                        None if user_turn is None else user_turn.id
+                    ),
                 )
             result = await asyncio.to_thread(
                 self._provider.respond,
                 prompt,
             )
         except Exception:
-            await presenter.send(
-                TelegramResponse(
-                    chat_id=turn.chat_id,
-                    kind=TelegramResponseKind.ERROR,
-                    text="Не удалось подготовить ответ. Попробуйте ещё раз.",
-                )
+            self._record_transcript_failure(
+                user_turn,
+                FailureStage.PROVIDER,
+                "provider_request_failed",
             )
+            try:
+                await presenter.send(
+                    TelegramResponse(
+                        chat_id=turn.chat_id,
+                        kind=TelegramResponseKind.ERROR,
+                        text="Не удалось подготовить ответ. Попробуйте ещё раз.",
+                    )
+                )
+            except Exception:
+                self._record_transcript_failure(
+                    user_turn,
+                    FailureStage.DELIVERY,
+                    "telegram_error_delivery_failed",
+                )
+                raise
             return None
 
-        if result.fallback_from is not None:
+        assistant_turn = None
+        if self._session_store is not None and user_turn is not None:
+            try:
+                assistant_turn = self._session_store.append_assistant_turn(
+                    session_id=user_turn.session_id,
+                    content=result.text,
+                    provider_response_id=result.response_id,
+                )
+            except Exception:
+                await presenter.send(
+                    TelegramResponse(
+                        chat_id=turn.chat_id,
+                        kind=TelegramResponseKind.ERROR,
+                        text="Не удалось сохранить ответ. Попробуйте ещё раз.",
+                    )
+                )
+                return None
+        try:
+            if result.fallback_from is not None:
+                await presenter.send(
+                    TelegramResponse(
+                        chat_id=turn.chat_id,
+                        kind=TelegramResponseKind.NOTICE,
+                        text=(
+                            "OAuth недоступен; использован API key. "
+                            "Это может привести к расходам."
+                        ),
+                    )
+                )
             await presenter.send(
                 TelegramResponse(
                     chat_id=turn.chat_id,
-                    kind=TelegramResponseKind.NOTICE,
-                    text=(
-                        "OAuth недоступен; использован API key. "
-                        "Это может привести к расходам."
-                    ),
+                    kind=TelegramResponseKind.FINAL,
+                    text=result.text,
                 )
             )
-        await presenter.send(
-            TelegramResponse(
-                chat_id=turn.chat_id,
-                kind=TelegramResponseKind.FINAL,
-                text=result.text,
+        except Exception:
+            self._record_transcript_failure(
+                assistant_turn,
+                FailureStage.DELIVERY,
+                "telegram_delivery_failed",
             )
-        )
+            raise
         return result
+
+    def _record_transcript_failure(
+        self,
+        related_turn: TranscriptTurn | None,
+        stage: FailureStage,
+        error_kind: str,
+    ) -> None:
+        if self._session_store is None or related_turn is None:
+            return
+        self._session_store.record_failure(
+            session_id=related_turn.session_id,
+            related_turn_id=related_turn.id,
+            stage=stage,
+            error_kind=error_kind,
+        )
 
     def _response_port_for(
         self,
