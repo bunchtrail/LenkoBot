@@ -1,7 +1,12 @@
 import pytest
 
 from lenkobot.personas import Persona, PersonaCatalog
-from lenkobot.session_store import FailureStage, SQLiteSessionStore
+from lenkobot.session_store import (
+    FailureStage,
+    SQLiteSessionFinalizer,
+    SQLiteSessionStore,
+)
+from lenkobot.sqlite_schema import open_state_database
 from lenkobot.telegram_router import (
     IncomingTelegramMessage,
     SQLiteConversationStore,
@@ -12,6 +17,19 @@ from lenkobot.telegram_router import (
 class DiscardingReplyPort:
     def send(self, turn):
         pass
+
+
+class FixedSummaryGenerator:
+    def __init__(self, result="A bounded summary", error=None):
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    def generate(self, *, turns):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 def catalog():
@@ -167,3 +185,107 @@ def test_provider_and_delivery_failures_are_redacted_operational_records(tmp_pat
         (FailureStage.DELIVERY, "telegram_delivery_failed"),
     ]
     assert "Durable answer" not in " ".join(item.error_kind for item in failures)
+
+
+def test_failed_summary_generation_preserves_active_session_and_raw_turns(tmp_path):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Keep this raw turn",
+    )
+    generator = FixedSummaryGenerator(error=RuntimeError("provider unavailable"))
+    finalizer = SQLiteSessionFinalizer(database_path, generator)
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
+
+    assert [item.content for item in store.list_turns(session_id=turn.session_id, user_id=42)] == [
+        "Keep this raw turn"
+    ]
+    assert store.ensure_active_session(user_id=42, persona_session_id=lane.session_id).id == turn.session_id
+
+
+def test_finalization_is_atomic_idempotent_and_opens_next_generation(tmp_path):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Summarize this",
+    )
+    store.append_assistant_turn(
+        session_id=turn.session_id,
+        content="And this answer",
+        provider_response_id="resp-1",
+    )
+    connection = open_state_database(database_path)
+    connection.execute(
+        """
+        INSERT INTO memory_extraction_run (
+            owner_user_id, session_id, source_turn_id, lifecycle_epoch,
+            status, created_at, updated_at
+        ) VALUES (42, ?, ?, 1, 'completed', 'now', 'now')
+        """,
+        (turn.session_id, turn.id),
+    )
+    connection.commit()
+    connection.close()
+    generator = FixedSummaryGenerator()
+    finalizer = SQLiteSessionFinalizer(database_path, generator)
+
+    first = finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
+    second = finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
+    next_session = store.ensure_active_session(user_id=42, persona_session_id=lane.session_id)
+
+    assert first == second
+    assert first.content == "A bounded summary"
+    assert first.source_turn_count == 2
+    assert generator.calls == 1
+    assert store.list_turns(session_id=turn.session_id, user_id=42) == ()
+    check = open_state_database(database_path)
+    assert check.execute(
+        "SELECT status FROM memory_extraction_run WHERE source_turn_id = ?",
+        (turn.id,),
+    ).fetchone()[0] == "completed"
+    check.close()
+    assert next_session.id != turn.session_id
+    assert next_session.generation == 2
+
+
+@pytest.mark.parametrize("status", ["pending", "processing", "failed"])
+def test_incomplete_memory_extraction_blocks_finalization_without_calling_generator(
+    tmp_path,
+    status,
+):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Wait for extraction",
+    )
+    connection = open_state_database(database_path)
+    connection.execute(
+        """
+        INSERT INTO memory_extraction_run (
+            owner_user_id, session_id, source_turn_id, lifecycle_epoch,
+            status, created_at, updated_at
+        ) VALUES (42, ?, ?, 1, ?, 'now', 'now')
+        """,
+        (turn.session_id, turn.id, status),
+    )
+    connection.commit()
+    connection.close()
+    generator = FixedSummaryGenerator()
+    finalizer = SQLiteSessionFinalizer(database_path, generator)
+
+    with pytest.raises(RuntimeError, match="extraction is not complete"):
+        finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
+
+    assert generator.calls == 0
+    assert store.turn_count() == 1

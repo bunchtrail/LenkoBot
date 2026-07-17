@@ -145,10 +145,10 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 
 ### Работы
 
-- [ ] Добавить `session_summary` migration и store contract.
+- [x] Добавить `session_summary` migration и store contract.
 - [ ] Добавить `memory_extraction_run` migration и state machine.
 - [ ] Добавить `memory_revision` migration и optimistic edit.
-- [ ] Добавить owner lifecycle epoch и reset state.
+- [x] Добавить owner lifecycle epoch и reset state.
 - [ ] Реализовать per-turn automatic memory extraction.
 - [ ] Сохранять typed category каждого candidate.
 - [ ] Сохранять provenance turn/session каждого candidate.
@@ -159,10 +159,10 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 - [ ] Добавить local deny rules для health/intimate data.
 - [ ] Добавить local deny rules для contacts/addresses.
 - [ ] Реализовать bounded typed session summary.
-- [ ] Реализовать idempotent `SessionFinalizer`.
+- [x] Реализовать idempotent `SessionFinalizer`.
 - [ ] Выбрать и добавить explicit close/new Telegram command.
-- [ ] Блокировать close при pending/failed extraction.
-- [ ] Сохранять summary и complete extraction outcomes до удаления raw turns.
+- [x] Блокировать close при pending/failed extraction.
+- [x] Сохранять summary и complete extraction outcomes до удаления raw turns.
 - [ ] Расширить context: recent window + latest summary + scoped memory.
 - [ ] Реализовать memory revisions до explicit delete.
 - [ ] Реализовать automatic cascade для derived memory и summary.
@@ -178,8 +178,8 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 - [ ] Extracted fact доступен следующему context build до session close.
 - [ ] Active memory содержит проверяемые category, provenance и confidence.
 - [ ] Запрещённые sensitive categories не сохраняются в regression corpus.
-- [ ] Summary/extraction failure не удаляет raw turns.
-- [ ] Повторный close идемпотентен.
+- [x] Summary/extraction failure не удаляет raw turns.
+- [x] Повторный close идемпотентен.
 - [ ] Stale result старого reset epoch не восстанавливает данные.
 - [ ] Memory SQL ACL работает через Telegram и domain/web service ports.
 - [ ] Prompt injection из memory остаётся untrusted data.

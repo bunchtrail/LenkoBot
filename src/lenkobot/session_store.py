@@ -45,11 +45,195 @@ class TranscriptFailure:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    id: int
+    session_id: int
+    owner_user_id: int
+    content: str
+    source_turn_count: int
+    lifecycle_epoch: int
+    status: str
+    created_at: str
+
+
+class SummaryGenerator(Protocol):
+    def generate(self, *, turns: tuple[TranscriptTurn, ...]) -> str: ...
+
+
 class SessionFinalizer(Protocol):
-    def finalize(self, *, session_id: int, owner_user_id: int) -> None: ...
+    def finalize(
+        self,
+        *,
+        session_id: int,
+        owner_user_id: int,
+    ) -> SessionSummary: ...
 
 
 _ERROR_KIND = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
+_MAX_SUMMARY_CHARS = 4_000
+
+
+class SQLiteSessionFinalizer:
+    def __init__(
+        self,
+        database_path: Path | str,
+        summary_generator: SummaryGenerator,
+    ) -> None:
+        self._connection = open_state_database(database_path)
+        self._summary_generator = summary_generator
+
+    def finalize(
+        self,
+        *,
+        session_id: int,
+        owner_user_id: int,
+    ) -> SessionSummary:
+        existing = self._get_summary(session_id=session_id, owner_user_id=owner_user_id)
+        if existing is not None:
+            return existing
+
+        session = self._load_active_session(
+            session_id=session_id,
+            owner_user_id=owner_user_id,
+        )
+        lifecycle_epoch = int(session["lifecycle_epoch"])
+        turns = self._load_turns(session_id=session_id)
+        self._ensure_extraction_gate(session_id=session_id)
+        content = self._summary_generator.generate(turns=turns)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("session summary cannot be empty")
+        content = content.strip()
+        if len(content) > _MAX_SUMMARY_CHARS:
+            raise ValueError("session summary exceeds the bounded limit")
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._get_summary(
+                session_id=session_id,
+                owner_user_id=owner_user_id,
+            )
+            if existing is not None:
+                self._connection.commit()
+                return existing
+            current = self._load_active_session(
+                session_id=session_id,
+                owner_user_id=owner_user_id,
+            )
+            if int(current["lifecycle_epoch"]) != lifecycle_epoch:
+                raise RuntimeError("owner lifecycle changed during finalization")
+            current_turns = self._load_turns(session_id=session_id)
+            if tuple(turn.id for turn in current_turns) != tuple(
+                turn.id for turn in turns
+            ):
+                raise RuntimeError("session changed during finalization")
+            self._ensure_extraction_gate(session_id=session_id)
+            now = _utc_now()
+            cursor = self._connection.execute(
+                """
+                INSERT INTO session_summary (
+                    session_id, owner_user_id, content, source_turn_count,
+                    lifecycle_epoch, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?)
+                """,
+                (
+                    session_id,
+                    owner_user_id,
+                    content,
+                    len(turns),
+                    int(current["lifecycle_epoch"]),
+                    now,
+                ),
+            )
+            self._connection.execute(
+                "DELETE FROM transcript_turn WHERE session_id = ?",
+                (session_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE session
+                SET status = 'closed', closed_at = ?
+                WHERE id = ? AND owner_user_id = ? AND status = 'active'
+                """,
+                (now, session_id, owner_user_id),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM session_summary WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return _summary_from_row(row)
+
+    def _get_summary(
+        self,
+        *,
+        session_id: int,
+        owner_user_id: int,
+    ) -> SessionSummary | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM session_summary
+            WHERE session_id = ? AND owner_user_id = ?
+            """,
+            (session_id, owner_user_id),
+        ).fetchone()
+        return None if row is None else _summary_from_row(row)
+
+    def _load_active_session(
+        self,
+        *,
+        session_id: int,
+        owner_user_id: int,
+    ) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT active_session.id, profile.lifecycle_epoch
+            FROM session AS active_session
+            JOIN user_profile AS profile
+                ON profile.user_id = active_session.owner_user_id
+            WHERE active_session.id = ?
+                AND active_session.owner_user_id = ?
+                AND active_session.status = 'active'
+                AND profile.lifecycle_state = 'active'
+            """,
+            (session_id, owner_user_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("active session does not exist for owner")
+        return row
+
+    def _load_turns(self, *, session_id: int) -> tuple[TranscriptTurn, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT id, session_id, sequence, role, content,
+                provider_response_id, created_at
+            FROM transcript_turn
+            WHERE session_id = ?
+            ORDER BY sequence ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        return tuple(_turn_from_row(row) for row in rows)
+
+    def _ensure_extraction_gate(self, *, session_id: int) -> None:
+        pending = int(
+            self._connection.execute(
+                """
+                SELECT COUNT(*) FROM memory_extraction_run
+                WHERE session_id = ?
+                    AND status IN ('pending', 'processing', 'failed')
+                """,
+                (session_id,),
+            ).fetchone()[0]
+        )
+        if pending:
+            raise RuntimeError("memory extraction is not complete")
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 class SQLiteSessionStore:
@@ -387,5 +571,18 @@ def _failure_from_row(row: sqlite3.Row) -> TranscriptFailure:
         related_turn_id=int(row["related_turn_id"]),
         stage=FailureStage(str(row["stage"])),
         error_kind=str(row["error_kind"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _summary_from_row(row: sqlite3.Row) -> SessionSummary:
+    return SessionSummary(
+        id=int(row["id"]),
+        session_id=int(row["session_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        content=str(row["content"]),
+        source_turn_count=int(row["source_turn_count"]),
+        lifecycle_epoch=int(row["lifecycle_epoch"]),
+        status=str(row["status"]),
         created_at=str(row["created_at"]),
     )
