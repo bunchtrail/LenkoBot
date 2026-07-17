@@ -73,7 +73,7 @@
 - OAuth fallback не срабатывает для network errors, rate limits, произвольных `401/403` или ошибки модели. Он разрешён только для явно классифицированного entitlement failure.
 - OAuth client ID является конфигурируемым. Не считать public client ID Hermes принадлежащим LenkoBot или стабильной production dependency.
 - Official xAI docs не подтверждают, что OAuth bearer имеет тот же direct inference host и entitlement contract, что API key. Live OAuth proof подтверждает только текущий account; provider обязан сохранять source identity и не делать fallback по одному raw `403`.
-- `Assumed`: на Windows токены и Telegram secret хранятся через DPAPI/Credential Manager; в Docker/VPS секреты инжектируются внешним secret mechanism, а не записываются в SQLite.
+- `Confirmed`: на Windows OAuth token state хранится в generic credential Windows Credential Manager под versioned target name; Telegram secret остаётся внешним secret configuration. В Docker/VPS секреты инжектируются внешним secret mechanism, а не записываются в SQLite.
 
 ## Минимальная модель данных
 
@@ -186,14 +186,16 @@ IncomingTelegramMessage
 `Confirmed`: первая provider vertical реализует только non-streaming text request к Responses API. Она не подключается к Telegram renderer до появления отдельного application service.
 
 - `CredentialSource` возвращает bearer, expiry, base URL и source identity. API-key source использует direct `https://api.x.ai/v1`; OAuth source получает access token через refresh coordinator и требует explicit base URL.
-- Bearer values не появляются в `repr`, errors или result objects. Transport принимает только HTTPS endpoint с host из explicit allowlist; default allowlist содержит `api.x.ai`.
+- Bearer values не появляются в `repr`, errors или result objects. Transport принимает только HTTPS endpoint на default port с host из explicit allowlist; default allowlist содержит `api.x.ai`.
 - Minimal request имеет `model` и string `input`. Final text собирается только из assistant `message` items и `output_text` parts; reasoning и неизвестные items пропускаются.
 - Provider result содержит credential source и `fallback_from`, чтобы presentation layer мог явно уведомить пользователя о переходе на платный API key.
 - `oauth_then_api_key` требует обе configured credential sources и переключается только после typed `EntitlementDenied`. Generic `401`, raw `403`, `429`, network failure и `5xx` не запускают fallback.
 - Transport по умолчанию не угадывает entitlement по undocumented response body. Подтверждённый classifier может быть injected отдельно без изменения policy owner.
 - OAuth lifecycle использует injected `OAuthCredentialStore`, `OAuthRefreshClient` и exclusive lock. Coordinator под lock повторно читает state, использует ещё валидный access token или выполняет refresh и сохраняет результат до освобождения lock; это предотвращает гонки rotating refresh token.
 - `OAuthCredentialSource` не знает формат или место хранения секретов и получает access token только через coordinator. Token state и request secrets не попадают в SQLite, `repr` или provider errors.
-- В эту vertical не входят concrete Windows DPAPI/Credential Manager adapter и device-code login workflow. Composition root обязан fail-closed, если secure store, refresh client или lock не сконфигурированы.
+- Concrete Windows Credential Manager adapter и device-code login workflow входят в эту vertical. Composition root обязан fail-closed, если secure store, refresh client или lock не сконфигурированы.
+- Windows adapter использует Credential Manager generic blob с лимитом 2560 bytes и named `Local\\` mutex. `WAIT_ABANDONED` продолжает lifecycle после повторного чтения state; timeout/failure блокирует refresh.
+- Device login разделён на `start` (URL/code для presentation) и `complete` (poll и одно сохранение state под refresh lock). Device и token endpoints принимают только approved HTTPS hosts на default port; verification URI из внешнего ответа проходит такую же проверку. Автоматическое открытие браузера и persistence при terminal error не входят в contract.
 
 ## Application service и Telegram presentation
 

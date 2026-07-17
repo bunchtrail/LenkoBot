@@ -316,6 +316,7 @@ def test_urllib_form_client_encodes_payload_and_preserves_timeout(monkeypatch):
     (
         "http://auth.x.ai/oauth2/token",
         "https://auth.x.ai.attacker.test/oauth2/token",
+        "https://auth.x.ai:8443/oauth2/token",
         "https://auth.x.ai/oauth2/token?redirect=evil",
     ),
 )

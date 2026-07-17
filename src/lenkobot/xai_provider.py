@@ -381,10 +381,15 @@ class XaiOAuthRefreshClient:
 
     @staticmethod
     def _validate_token_url(token_url: str) -> None:
-        parsed = urlsplit(token_url)
+        try:
+            parsed = urlsplit(token_url)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("OAuth token target is not an allowed HTTPS host") from None
         if (
             parsed.scheme != "https"
             or parsed.hostname != "auth.x.ai"
+            or port not in (None, 443)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
@@ -534,10 +539,17 @@ class XaiResponsesTransport:
         )
 
     def _responses_endpoint(self, base_url: str) -> str:
-        parsed = urlsplit(base_url)
+        try:
+            parsed = urlsplit(base_url)
+            port = parsed.port
+        except ValueError:
+            raise UntrustedInferenceHost(
+                "xAI credential target is not an allowed HTTPS host"
+            ) from None
         if (
             parsed.scheme != "https"
             or parsed.hostname not in self._allowed_hosts
+            or port not in (None, 443)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query

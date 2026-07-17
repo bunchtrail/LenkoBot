@@ -143,7 +143,11 @@ def test_responses_transport_rejects_untrusted_or_insecure_credential_host():
     http_client = RecordingHttpClient(HttpResponse(status=200, headers={}, body="{}"))
     transport = XaiResponsesTransport(http_client=http_client)
 
-    for base_url in ("https://api.x.ai.attacker.test/v1", "http://api.x.ai/v1"):
+    for base_url in (
+        "https://api.x.ai.attacker.test/v1",
+        "https://api.x.ai:8443/v1",
+        "http://api.x.ai/v1",
+    ):
         bearer = BearerCredential(
             token="secret",
             expires_at=None,

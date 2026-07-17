@@ -26,6 +26,9 @@
 - Проверка не сохраняла access token, refresh token или device code в проекте или persistent credential store.
 - Для следующей vertical подтверждён strict path: сначала OAuth credential lifecycle, затем composition root; временный `api_key_only` bootstrap не выбирается.
 - OAuth lifecycle владеет только refresh orchestration: secure store, refresh client и exclusive lock инжектируются отдельно, а полный цикл `read -> refresh -> persist` выполняется под lock.
+- Concrete Windows deployment выбран через Credential Manager generic blob и named `Local\\` mutex; DPAPI-файл в эту vertical не добавляется.
+- Device flow имеет отдельные `start` и `complete` операции: presentation получает verification data отдельно, а token state сохраняется только после успешного poll под refresh lock.
+- Device authorization, refresh и inference transport принимают bearer-token endpoints только на approved HTTPS host и default port; malformed external device payload превращается в controlled credential error без persistence.
 
 ## Находки
 
@@ -58,7 +61,7 @@
 - Политика бэкапа SQLite, список предзаданных personas и media/STT provider остаются `Open` в `mvp-spec.md`.
 - Public OAuth client ID Hermes остаётся внешней и потенциально нестабильной зависимостью, несмотря на успешную проверку account entitlement.
 - Совместимость OAuth bearer с direct `api.x.ai/v1` и точная классификация entitlement denial требуют отдельного подтверждения. До него raw `403` не должен запускать платный API-key fallback.
-- Concrete Windows DPAPI/Credential Manager adapter, device-code login UX, token revocation и cross-platform secret backend остаются отдельными verticals; текущий lifecycle не создаёт plaintext persistence.
+- Portable Docker/VPS secret backend, token revocation, account switching и device-login presentation UX остаются отдельными verticals; текущий Windows adapter не создаёт plaintext persistence.
 - Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая реализация должна сохранять только active records в context.
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
 
@@ -98,4 +101,9 @@
 - Красный цикл OAuth lifecycle начался с `ImportError` для отсутствующего `OAuthRefreshCoordinator`.
 - Lifecycle tests подтверждают отсутствие refresh для валидного access token, rotation и persist для expired token, один refresh при конкурентных чтениях, сохранение старого state при ошибке, form-encoded token request, host pinning и отсутствие token secrets в OAuth errors.
 - После OAuth lifecycle targeted provider suite завершился: `24 passed`; полный suite: `62 passed`. `compileall`, `uv lock --check` и `git diff --check` завершились успешно.
-- Concrete secure store для Windows и device-code login в эту проверку не входили; lifecycle принимает их через injected `OAuthCredentialStore` и exclusive lock.
+- Concrete credential/device vertical начала с `ModuleNotFoundError` для отсутствующего `lenkobot.oauth_credentials`.
+- Credential/device tests подтверждают versioned Credential Manager target, redacted token state, missing/malformed/oversized credential handling, `WAIT_ABANDONED`, timeout cleanup, RFC 8628 pending/slow-down polling и ровно одно persistence после success.
+- Security regression tests подтверждают отказ от non-default port для device, refresh и inference endpoints, controlled rejection malformed duration/verification URI и отсутствие poll/persistence для invalid device authorization.
+- После concrete secure backend vertical OAuth-related suite завершился: `44 passed`.
+- Read-only native Windows smoke успешно вызвал `CredReadW` для уникального отсутствующего target и acquire/release named mutex; credential не создавался и token state не выводился.
+- Финальный полный suite завершился: `82 passed`; `compileall`, `uv lock --check` и `git diff --check` прошли успешно.
