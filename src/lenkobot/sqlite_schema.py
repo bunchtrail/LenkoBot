@@ -109,10 +109,7 @@ def _create_memory_schema(connection: sqlite3.Connection) -> None:
 
 
 def _add_conversation_version(connection: sqlite3.Connection) -> None:
-    columns = {
-        str(row["name"])
-        for row in connection.execute("PRAGMA table_info(conversation)").fetchall()
-    }
+    columns = _column_names(connection, "conversation")
     if "version" not in columns:
         connection.execute(
             """
@@ -120,6 +117,13 @@ def _add_conversation_version(connection: sqlite3.Connection) -> None:
             ADD COLUMN version INTEGER NOT NULL DEFAULT 0
             """
         )
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _create_session_schema(connection: sqlite3.Connection) -> None:
@@ -200,11 +204,138 @@ def _create_session_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_phase_two_lifecycle_schema(connection: sqlite3.Connection) -> None:
+    # Keep the additive migration safe for sparse legacy fixtures while still
+    # failing on incompatible pre-existing tables when indexes are created.
+    _create_memory_schema(connection)
+
+    profile_columns = _column_names(connection, "user_profile")
+    if "lifecycle_epoch" not in profile_columns:
+        connection.execute(
+            """
+            ALTER TABLE user_profile
+            ADD COLUMN lifecycle_epoch INTEGER NOT NULL DEFAULT 1
+                CHECK(lifecycle_epoch > 0)
+            """
+        )
+    if "lifecycle_state" not in profile_columns:
+        connection.execute(
+            """
+            ALTER TABLE user_profile
+            ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'
+                CHECK(lifecycle_state IN ('active', 'reset_in_progress'))
+            """
+        )
+
+    memory_columns = _column_names(connection, "memory")
+    additions = {
+        "version": "INTEGER NOT NULL DEFAULT 1 CHECK(version > 0)",
+        "source": (
+            "TEXT NOT NULL DEFAULT 'manual' "
+            "CHECK(source IN ('manual', 'automatic'))"
+        ),
+        "category": (
+            "TEXT CHECK(category IS NULL OR length(trim(category)) > 0)"
+        ),
+        "confidence": (
+            "REAL CHECK(confidence IS NULL OR "
+            "(confidence >= 0.0 AND confidence <= 1.0))"
+        ),
+        "provenance_turn_id": "INTEGER",
+    }
+    for name, definition in additions.items():
+        if name not in memory_columns:
+            connection.execute(f"ALTER TABLE memory ADD COLUMN {name} {definition}")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_summary (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL UNIQUE
+                REFERENCES session(id) ON DELETE CASCADE,
+            owner_user_id INTEGER NOT NULL
+                REFERENCES user_profile(user_id) ON DELETE CASCADE,
+            content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+            source_turn_count INTEGER NOT NULL CHECK(source_turn_count >= 0),
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active', 'invalidated')),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_extraction_run (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL
+                REFERENCES user_profile(user_id) ON DELETE CASCADE,
+            session_id INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            source_turn_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN (
+                    'pending', 'processing', 'completed', 'failed', 'discarded'
+                )),
+            attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+            error_kind TEXT CHECK(
+                error_kind IS NULL OR (
+                    length(trim(error_kind)) > 0 AND length(error_kind) <= 100
+                )
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(session_id, source_turn_id, lifecycle_epoch)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS memory_extraction_run_session_status_idx
+            ON memory_extraction_run(session_id, status, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_revision (
+            id INTEGER PRIMARY KEY,
+            memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+            owner_user_id INTEGER NOT NULL
+                REFERENCES user_profile(user_id) ON DELETE CASCADE,
+            version INTEGER NOT NULL CHECK(version > 0),
+            content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+            category TEXT CHECK(
+                category IS NULL OR length(trim(category)) > 0
+            ),
+            confidence REAL CHECK(
+                confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)
+            ),
+            changed_at TEXT NOT NULL,
+            UNIQUE(memory_id, version)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_audit (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            event_type TEXT NOT NULL CHECK(
+                event_type IN ('reset_completed')
+            ),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_conversation_schema,
     _create_memory_schema,
     _add_conversation_version,
     _create_session_schema,
+    _create_phase_two_lifecycle_schema,
 )
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 

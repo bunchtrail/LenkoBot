@@ -37,6 +37,9 @@
 - 17 июля 2026 пользователь подтвердил post-MVP target `Personal production`: single-owner Telegram companion с web-панелью, durable session summary/memory, задачами/reminders, web knowledge и изолированным confirmed sandbox. Полный порядок фаз, data contracts, failure semantics, release gates и принятые риски находятся в [product-roadmap.md](product-roadmap.md).
 - Roadmap audit выровнял старую MVP-спецификацию с подтверждённой final boundary: текущий baseline не заявляет ещё отсутствующие reminders/transcripts/media, API-key fallback исключён, Phase 3 зависит от Phase 2 reset boundary, а Phase 6 явно владеет migration к canonical versioned persona catalog.
 - Phase 1 разделяет immutable `persona_session` routing lane и concrete generation-aware `session`; raw turns и redacted operational failures принадлежат новому `SQLiteSessionStore`, а `SessionFinalizer` пока существует только как Phase 2 port.
+- Phase 2 schema foundation добавляется как migration v5: lifecycle epoch/state принадлежат owner profile; summary, extraction outcome, memory revision и content-free reset audit являются отдельными durable records. `provenance_turn_id` намеренно не имеет FK к raw transcript: session finalization должна иметь право удалить raw turns, сохранив принятую memory и её происхождение.
+- `Assumed`: encrypted export v1 использует versioned PAX tar внутри `age-encryption.org/v1` X25519 `.tar.age`; приложение хранит только public recipient, а private identity никогда не входит в SQLite, export или logs. Точный managed-file состав и recovery procedure остаются owner decisions.
+- `Confirmed`: официальный xAI Responses structured-output contract передаёт JSON Schema через `text.format` и возвращает JSON в `message/output_text`. Реализация должна оставаться transport-neutral и дополнительно валидировать typed result локально; OAuth bearer для structured request не включается без отдельного non-sensitive live smoke.
 - Phase 1 persistence order подтверждён как `user turn -> context/provider -> assistant turn -> delivery`; provider failure не создаёт assistant content, delivery failure не удаляет уже сохранённый assistant result.
 
 ## Находки
@@ -76,6 +79,8 @@
 - Portable Docker/VPS secret backend, token revocation, account switching и custom inference host остаются отдельными verticals; текущий Windows adapter не создаёт plaintext persistence.
 - Требования к soft-delete, retention/audit и automatic relationship summarization остаются Open; текущая command vertical использует физическое удаление и показывает только active records.
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
+- Для export остаются Open конкретный состав managed files, две owner-controlled recovery copies age identity и destructive restore UX. Потеря всех private identities означает необратимую потерю export и не компенсируется скрытым key escrow.
+- Для automatic memory остаются Open окончательная category taxonomy и live OAuth structured-output compatibility. До live gate extraction обязана быть disabled/fail-closed, а confidence остаётся metadata, не разрешением сохранять sensitive data.
 - Phase 0 live smoke остаётся environment blocker: `TELEGRAM_BOT_TOKEN` отсутствует в process, User и Machine environment. Найденный работающий `lenkobot run` был запущен до memory-command vertical, поэтому не доказывает `/remember`, `/memories` и `/forget`; без secret его нельзя безопасно перезапустить из текущего процесса.
 
 ## Проверка

@@ -54,6 +54,7 @@
 - Авторизованный raw user turn сохраняется до context/provider work. Успешный assistant result сохраняется до Telegram delivery; controlled provider/delivery failures лежат отдельно от content и не содержат raw errors.
 - Recent transcript ограничен восемью turn, 6000 символами суммарно и 2000 на turn; current turn и memory/relationship payload также имеют фиксированные char limits. Все transcript/memory sections помечены как untrusted data.
 - `SessionFinalizer` определён только как port для Phase 2. Phase 1 не публикует close/new command, не удаляет raw turns и не меняет active status скрыто.
+- `Confirmed`: Phase 2 расширяет schema только additive migration: lifecycle epoch/state принадлежат `user_profile`; `session_summary`, `memory_extraction_run`, `memory_revision` и content-free `security_audit` имеют отдельных владельцев. Provenance turn ID остаётся opaque ID без FK, потому что успешная finalization удаляет raw turn, но не принятую memory.
 - Prompt cache привязан к `persona_id` и `identity_version`. Изменение identity инвалидирует только соответствующую persona session.
 - Общий Hermes `SOUL.md`, runner-global ephemeral prompt и profile multiplex не используются как механизм переключения персонажей.
 

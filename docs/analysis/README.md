@@ -7,6 +7,7 @@
 - [xAI Responses REST contract](xai-responses.md)
 - [OAuth secure backends](oauth-secure-backend.md)
 - [GitHub Actions Python and uv CI](github-actions-python-uv-ci-2026-07.md)
+- [Phase 2 encrypted export and structured output](phase2-export-and-structured-output-2026-07.md)
 - [Память, личности и проактивность](memory-personas.md)
 
 Отчёты сохранены без сокращения и смысловой переработки.

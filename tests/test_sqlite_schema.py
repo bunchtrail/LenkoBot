@@ -173,6 +173,64 @@ def test_version_three_database_adds_session_schema_without_rewriting_lane_ids(t
     migrated.close()
 
 
+def test_phase_two_lifecycle_schema_is_additive_and_preserves_existing_rows(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE user_profile (
+            user_id INTEGER PRIMARY KEY,
+            timezone TEXT NOT NULL DEFAULT 'UTC',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE memory (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            scope TEXT NOT NULL,
+            persona_id INTEGER,
+            relationship_id INTEGER,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            provenance_session_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO user_profile (user_id, timezone, created_at)
+        VALUES (42, 'UTC', 'now');
+        INSERT INTO memory (
+            id, user_id, scope, kind, content, created_at, updated_at
+        ) VALUES (11, 42, 'shared', 'fact', 'Keep me', 'now', 'now');
+        PRAGMA user_version = 4;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = open_state_database(database_path)
+    tables = {
+        row[0]
+        for row in migrated.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    profile = migrated.execute(
+        "SELECT user_id, lifecycle_epoch, lifecycle_state FROM user_profile"
+    ).fetchone()
+    memory = migrated.execute(
+        """
+        SELECT id, version, source, category, confidence, provenance_turn_id
+        FROM memory WHERE id = 11
+        """
+    ).fetchone()
+
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    assert {"session_summary", "memory_extraction_run", "memory_revision", "security_audit"} <= tables
+    assert tuple(profile) == (42, 1, "active")
+    assert tuple(memory) == (11, 1, "manual", None, None, None)
+    migrated.close()
+
+
 def test_failed_migration_rolls_back_ddl_and_does_not_advance_version(tmp_path):
     database_path = tmp_path / "state.db"
     connection = sqlite3.connect(database_path)
