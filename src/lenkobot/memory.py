@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from enum import StrEnum
 import json
 from pathlib import Path
+import re
 import sqlite3
+from typing import Protocol
 
 from .personas import Persona
 from .sqlite_schema import open_state_database
@@ -19,6 +21,14 @@ class MemoryScope(StrEnum):
 class MemoryStatus(StrEnum):
     ACTIVE = "active"
     DELETED = "deleted"
+
+
+class ExtractionRunStatus(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DISCARDED = "discarded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +71,29 @@ class Relationship:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryExtractionRun:
+    id: int
+    owner_user_id: int
+    session_id: int
+    source_turn_id: int
+    lifecycle_epoch: int
+    status: ExtractionRunStatus
+    attempt: int
+    error_kind: str | None
+    created_at: str
+    updated_at: str
+
+
+class MemoryExtractionRunReader(Protocol):
+    def has_blocking_extraction_runs(
+        self,
+        *,
+        owner_user_id: int,
+        session_id: int,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryLimits:
     shared: int = 20
     persona_private: int = 20
@@ -93,6 +126,9 @@ class MemoryContext:
 
 class RelationshipVersionConflict(RuntimeError):
     pass
+
+
+_EXTRACTION_ERROR_KIND = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
 
 
 class SQLiteMemoryStore:
@@ -161,6 +197,185 @@ class SQLiteMemoryStore:
         if relationship is None:
             raise RuntimeError("relationship was not created")
         return relationship
+
+    def ensure_extraction_run(
+        self,
+        *,
+        owner_user_id: int,
+        session_id: int,
+        source_turn_id: int,
+    ) -> MemoryExtractionRun:
+        _validate_positive_ids(owner_user_id, session_id, source_turn_id)
+        timestamp = self._timestamp()
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            session = self._connection.execute(
+                """
+                SELECT active_session.owner_user_id, active_session.status,
+                    profile.lifecycle_epoch, profile.lifecycle_state
+                FROM session AS active_session
+                JOIN user_profile AS profile
+                    ON profile.user_id = active_session.owner_user_id
+                WHERE active_session.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None or int(session["owner_user_id"]) != owner_user_id:
+                raise KeyError("session not found for owner")
+            if session["status"] != "active":
+                raise RuntimeError("extraction session is not active")
+            if session["lifecycle_state"] != "active":
+                raise RuntimeError("owner lifecycle is not active")
+            source_turn = self._connection.execute(
+                """
+                SELECT id FROM transcript_turn
+                WHERE id = ? AND session_id = ?
+                """,
+                (source_turn_id, session_id),
+            ).fetchone()
+            if source_turn is None:
+                raise ValueError("source turn does not belong to session")
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_extraction_run (
+                    owner_user_id, session_id, source_turn_id, lifecycle_epoch,
+                    status, attempt, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    owner_user_id,
+                    session_id,
+                    source_turn_id,
+                    int(session["lifecycle_epoch"]),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT * FROM memory_extraction_run
+                WHERE session_id = ? AND source_turn_id = ?
+                    AND lifecycle_epoch = ?
+                """,
+                (
+                    session_id,
+                    source_turn_id,
+                    int(session["lifecycle_epoch"]),
+                ),
+            ).fetchone()
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        if row is None:
+            raise RuntimeError("extraction run was not created")
+        return _extraction_run_from_row(row)
+
+    def get_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+    ) -> MemoryExtractionRun | None:
+        _validate_positive_ids(run_id, owner_user_id)
+        row = self._connection.execute(
+            """
+            SELECT * FROM memory_extraction_run
+            WHERE id = ? AND owner_user_id = ?
+            """,
+            (run_id, owner_user_id),
+        ).fetchone()
+        return None if row is None else _extraction_run_from_row(row)
+
+    def claim_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+    ) -> MemoryExtractionRun:
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.PENDING,
+            status=ExtractionRunStatus.PROCESSING,
+            attempt_increment=1,
+            error_kind=None,
+            conflict_message="extraction run is not claimable",
+        )
+
+    def complete_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+    ) -> MemoryExtractionRun:
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.PROCESSING,
+            status=ExtractionRunStatus.COMPLETED,
+            attempt_increment=0,
+            error_kind=None,
+            conflict_message="extraction run is terminal or not processing",
+        )
+
+    def fail_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+        error_kind: str,
+    ) -> MemoryExtractionRun:
+        if not isinstance(error_kind, str) or _EXTRACTION_ERROR_KIND.fullmatch(error_kind) is None:
+            raise ValueError("extraction error_kind must be a bounded identifier")
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.PROCESSING,
+            status=ExtractionRunStatus.FAILED,
+            attempt_increment=0,
+            error_kind=error_kind,
+            conflict_message="extraction run is terminal or not processing",
+        )
+
+    def discard_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+    ) -> MemoryExtractionRun:
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.PROCESSING,
+            status=ExtractionRunStatus.DISCARDED,
+            attempt_increment=0,
+            error_kind=None,
+            conflict_message="extraction run is terminal or not processing",
+        )
+
+    def has_blocking_extraction_runs(
+        self,
+        *,
+        owner_user_id: int,
+        session_id: int,
+    ) -> bool:
+        _validate_positive_ids(owner_user_id, session_id)
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM memory_extraction_run AS extraction
+            JOIN session AS active_session
+                ON active_session.id = extraction.session_id
+            WHERE extraction.session_id = ?
+                AND extraction.owner_user_id = ?
+                AND active_session.owner_user_id = ?
+                AND extraction.status IN ('pending', 'processing', 'failed')
+            LIMIT 1
+            """,
+            (session_id, owner_user_id, owner_user_id),
+        ).fetchone()
+        return row is not None
 
     def get_relationship(
         self,
@@ -398,6 +613,69 @@ class SQLiteMemoryStore:
     def close(self) -> None:
         self._connection.close()
 
+    def _transition_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+        expected_status: ExtractionRunStatus,
+        status: ExtractionRunStatus,
+        attempt_increment: int,
+        error_kind: str | None,
+        conflict_message: str,
+    ) -> MemoryExtractionRun:
+        _validate_positive_ids(run_id, owner_user_id)
+        timestamp = self._timestamp()
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                """
+                SELECT extraction.*, profile.lifecycle_epoch AS current_epoch,
+                    profile.lifecycle_state AS current_state
+                FROM memory_extraction_run AS extraction
+                JOIN user_profile AS profile
+                    ON profile.user_id = extraction.owner_user_id
+                WHERE extraction.id = ? AND extraction.owner_user_id = ?
+                """,
+                (run_id, owner_user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError("extraction run not found for owner")
+            if (
+                row["current_state"] != "active"
+                or int(row["current_epoch"]) != int(row["lifecycle_epoch"])
+            ):
+                raise RuntimeError("extraction run is stale")
+            if row["status"] != expected_status.value:
+                raise RuntimeError(conflict_message)
+            self._connection.execute(
+                """
+                UPDATE memory_extraction_run
+                SET status = ?, attempt = attempt + ?, error_kind = ?, updated_at = ?
+                WHERE id = ? AND owner_user_id = ? AND status = ?
+                """,
+                (
+                    status.value,
+                    attempt_increment,
+                    error_kind,
+                    timestamp,
+                    run_id,
+                    owner_user_id,
+                    expected_status.value,
+                ),
+            )
+            updated = self._connection.execute(
+                "SELECT * FROM memory_extraction_run WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        if updated is None:
+            raise RuntimeError("extraction run disappeared after transition")
+        return _extraction_run_from_row(updated)
+
     def _list_records(
         self,
         where_clause: str,
@@ -461,3 +739,23 @@ class SQLiteMemoryStore:
 
     def _timestamp(self) -> str:
         return self._clock().astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _validate_positive_ids(*values: int) -> None:
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
+        raise ValueError("memory extraction identifiers must be positive integers")
+
+
+def _extraction_run_from_row(row: sqlite3.Row) -> MemoryExtractionRun:
+    return MemoryExtractionRun(
+        id=int(row["id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        session_id=int(row["session_id"]),
+        source_turn_id=int(row["source_turn_id"]),
+        lifecycle_epoch=int(row["lifecycle_epoch"]),
+        status=ExtractionRunStatus(str(row["status"])),
+        attempt=int(row["attempt"]),
+        error_kind=(None if row["error_kind"] is None else str(row["error_kind"])),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )

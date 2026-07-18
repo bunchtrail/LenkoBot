@@ -6,6 +6,7 @@ import re
 import sqlite3
 from typing import Protocol
 
+from .memory import MemoryExtractionRunReader
 from .sqlite_schema import open_state_database
 
 
@@ -79,9 +80,12 @@ class SQLiteSessionFinalizer:
         self,
         database_path: Path | str,
         summary_generator: SummaryGenerator,
+        *,
+        extraction_store: MemoryExtractionRunReader,
     ) -> None:
         self._connection = open_state_database(database_path)
         self._summary_generator = summary_generator
+        self._extraction_store = extraction_store
 
     def finalize(
         self,
@@ -99,7 +103,10 @@ class SQLiteSessionFinalizer:
         )
         lifecycle_epoch = int(session["lifecycle_epoch"])
         turns = self._load_turns(session_id=session_id)
-        self._ensure_extraction_gate(session_id=session_id)
+        self._ensure_extraction_gate(
+            session_id=session_id,
+            owner_user_id=owner_user_id,
+        )
         content = self._summary_generator.generate(turns=turns)
         if not isinstance(content, str) or not content.strip():
             raise ValueError("session summary cannot be empty")
@@ -127,7 +134,10 @@ class SQLiteSessionFinalizer:
                 turn.id for turn in turns
             ):
                 raise RuntimeError("session changed during finalization")
-            self._ensure_extraction_gate(session_id=session_id)
+            self._ensure_extraction_gate(
+                session_id=session_id,
+                owner_user_id=owner_user_id,
+            )
             now = _utc_now()
             cursor = self._connection.execute(
                 """
@@ -218,18 +228,11 @@ class SQLiteSessionFinalizer:
         ).fetchall()
         return tuple(_turn_from_row(row) for row in rows)
 
-    def _ensure_extraction_gate(self, *, session_id: int) -> None:
-        pending = int(
-            self._connection.execute(
-                """
-                SELECT COUNT(*) FROM memory_extraction_run
-                WHERE session_id = ?
-                    AND status IN ('pending', 'processing', 'failed')
-                """,
-                (session_id,),
-            ).fetchone()[0]
-        )
-        if pending:
+    def _ensure_extraction_gate(self, *, session_id: int, owner_user_id: int) -> None:
+        if self._extraction_store.has_blocking_extraction_runs(
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+        ):
             raise RuntimeError("memory extraction is not complete")
 
     def close(self) -> None:

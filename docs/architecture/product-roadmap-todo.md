@@ -165,7 +165,7 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 ### Работы
 
 - [x] Добавить `session_summary` migration и store contract.
-- [ ] Добавить `memory_extraction_run` migration и state machine.
+- [x] Добавить `memory_extraction_run` migration и state machine.
 - [ ] Добавить `memory_revision` migration и optimistic edit.
 - [x] Добавить owner lifecycle epoch и reset state.
 - [ ] Реализовать per-turn automatic memory extraction.
@@ -210,10 +210,11 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 ### Evidence
 
 - Commit: `pending`
+- Extraction-run targeted tests: `22 passed` (`memory` + `session_store`)
 - Sensitive-data corpus: `pending`
 - Export fixture: `pending`
 - Reset concurrency tests: `pending`
-- Full suite: `pending`
+- Full suite after seam: `156 passed`
 
 ## Phase 3. Tasks и durable reminders
 

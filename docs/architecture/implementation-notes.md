@@ -49,6 +49,7 @@
 - `Confirmed`: E2E bot использует отдельный reply response port и связывает каждый ответ с конкретным source `message_id`; user-client требует exact `reply_to_msg_id` и отклоняет delayed/duplicate/concurrent dialog activity. Cross-client numeric ID equality остаётся `Assumed` до live proof и при mismatch не заменяется timeout-based эвристикой.
 - `Confirmed`: временный E2E poller до state creation проверяет Bot API `getMe` против pinned bot ID; fresh external root создаётся как новый leaf и повторно resolve-ится до composition. Telethon listener принимает оба направления и отклоняет любое concurrent dialog activity, кроме собственной correlated command/reply пары.
 - `Confirmed`: 19 июля 2026 владелец явно принял setup blocker manual MTProto E2E: отдельный test-user Credential Manager state не настроен, поэтому реальный round-trip не выполняется. Это разрешённый `OR`-вариант Phase 0 gate; implementation и synthetic Bot API evidence остаются обязательными.
+- `Confirmed`: extraction-run state machine принадлежит memory boundary: `SQLiteMemoryStore` создаёт idempotent run с owner/session/turn provenance и текущим lifecycle epoch, атомарно claim-ит только `pending`, а `completed`, `failed` и `discarded` являются terminal outcomes. Все transitions проверяют owner и active current epoch; `SessionFinalizer` получает extraction gate через явный reader port и не владеет memory SQL.
 
 ## Находки
 
@@ -158,3 +159,5 @@
 - MTProto E2E implementation покрывает отдельный Windows Credential Manager state, pinned test-user/current-bot identities, fresh external bot state, Bot API identity preflight, exact reply-to correlation, concurrent-dialog rejection и безопасный normalized report. Финальный независимый review не нашёл high/medium findings.
 - После MTProto E2E vertical полный suite завершился: `150 passed`; `compileall`, `uv lock --check` и `git diff --check` успешны. Локальный E2E config и bot token доступны, но dedicated test-user credential state ещё не сохранён, поэтому реальный long-polling round-trip не выполнялся. Владелец принял этот setup blocker, и Phase 0 закрыта по `OR`-gate.
 - Phase 0 smoke/E2E feature commit `1052bb7` отправлен в `origin/main`; GitHub Actions run `29662347587` завершил оба job успешно: full tests/quality и migration/security regressions.
+- Phase 2 extraction-run red cycle начался с `ImportError` для отсутствующего state-machine contract. После реализации targeted memory/session suite завершился: `22 passed`; полный suite достиг `156 passed`.
+- Extraction-run contract намеренно не фиксирует retry/backoff, candidate taxonomy, source-turn pair semantics или provider structured-output behavior; это отдельные следующие seams и остаётся `Open`.

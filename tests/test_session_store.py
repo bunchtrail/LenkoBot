@@ -1,6 +1,7 @@
 import pytest
 
 from lenkobot.personas import Persona, PersonaCatalog
+from lenkobot.memory import SQLiteMemoryStore
 from lenkobot.session_store import (
     FailureStage,
     SQLiteSessionFinalizer,
@@ -187,6 +188,145 @@ def test_provider_and_delivery_failures_are_redacted_operational_records(tmp_pat
     assert "Durable answer" not in " ".join(item.error_kind for item in failures)
 
 
+def test_extraction_run_is_idempotent_and_keeps_turn_provenance(tmp_path):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    memory_store = SQLiteMemoryStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Extract this turn",
+    )
+
+    first = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+    second = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+
+    assert first == second
+    assert first.owner_user_id == 42
+    assert first.session_id == turn.session_id
+    assert first.source_turn_id == turn.id
+    assert first.lifecycle_epoch == 1
+    assert first.status.value == "pending"
+    assert first.attempt == 0
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_error"),
+    (("completed", None), ("failed", "extractor_failed"), ("discarded", None)),
+)
+def test_extraction_run_claims_once_and_has_terminal_transitions(
+    tmp_path,
+    terminal,
+    expected_error,
+):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    memory_store = SQLiteMemoryStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Process this turn",
+    )
+    run = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+
+    claimed = memory_store.claim_extraction_run(run.id, owner_user_id=42)
+
+    assert claimed.status.value == "processing"
+    assert claimed.attempt == 1
+    with pytest.raises(RuntimeError, match="claimable"):
+        memory_store.claim_extraction_run(run.id, owner_user_id=42)
+
+    if terminal == "completed":
+        finished = memory_store.complete_extraction_run(run.id, owner_user_id=42)
+    elif terminal == "failed":
+        finished = memory_store.fail_extraction_run(
+            run.id,
+            owner_user_id=42,
+            error_kind=expected_error,
+        )
+    else:
+        finished = memory_store.discard_extraction_run(run.id, owner_user_id=42)
+
+    assert finished.status.value == terminal
+    assert finished.error_kind == expected_error
+    with pytest.raises(RuntimeError, match="terminal"):
+        memory_store.complete_extraction_run(run.id, owner_user_id=42)
+
+
+def test_extraction_run_rejects_wrong_owner_and_invalid_source_turn(tmp_path):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    memory_store = SQLiteMemoryStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Owner-bound turn",
+    )
+
+    with pytest.raises(ValueError, match="turn does not belong"):
+        memory_store.ensure_extraction_run(
+            owner_user_id=42,
+            session_id=turn.session_id,
+            source_turn_id=turn.id + 999,
+        )
+    run = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+    with pytest.raises(KeyError):
+        memory_store.claim_extraction_run(run.id, owner_user_id=99)
+
+
+def test_extraction_run_rejects_stale_epoch_and_new_epoch_gets_new_run(tmp_path):
+    database_path = tmp_path / "state.db"
+    lane = routed_lane(database_path)
+    store = SQLiteSessionStore(database_path)
+    memory_store = SQLiteMemoryStore(database_path)
+    turn = store.begin_user_turn(
+        user_id=42,
+        persona_session_id=lane.session_id,
+        content="Epoch-bound turn",
+    )
+    stale = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+    connection = open_state_database(database_path)
+    connection.execute(
+        "UPDATE user_profile SET lifecycle_epoch = 2 WHERE user_id = 42"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="stale"):
+        memory_store.claim_extraction_run(stale.id, owner_user_id=42)
+
+    current = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
+    )
+    assert current.id != stale.id
+    assert current.lifecycle_epoch == 2
+
+
 def test_failed_summary_generation_preserves_active_session_and_raw_turns(tmp_path):
     database_path = tmp_path / "state.db"
     lane = routed_lane(database_path)
@@ -197,7 +337,12 @@ def test_failed_summary_generation_preserves_active_session_and_raw_turns(tmp_pa
         content="Keep this raw turn",
     )
     generator = FixedSummaryGenerator(error=RuntimeError("provider unavailable"))
-    finalizer = SQLiteSessionFinalizer(database_path, generator)
+    memory_store = SQLiteMemoryStore(database_path)
+    finalizer = SQLiteSessionFinalizer(
+        database_path,
+        generator,
+        extraction_store=memory_store,
+    )
 
     with pytest.raises(RuntimeError, match="provider unavailable"):
         finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
@@ -222,20 +367,20 @@ def test_finalization_is_atomic_idempotent_and_opens_next_generation(tmp_path):
         content="And this answer",
         provider_response_id="resp-1",
     )
-    connection = open_state_database(database_path)
-    connection.execute(
-        """
-        INSERT INTO memory_extraction_run (
-            owner_user_id, session_id, source_turn_id, lifecycle_epoch,
-            status, created_at, updated_at
-        ) VALUES (42, ?, ?, 1, 'completed', 'now', 'now')
-        """,
-        (turn.session_id, turn.id),
+    memory_store = SQLiteMemoryStore(database_path)
+    extraction_run = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
     )
-    connection.commit()
-    connection.close()
+    memory_store.claim_extraction_run(extraction_run.id, owner_user_id=42)
+    memory_store.complete_extraction_run(extraction_run.id, owner_user_id=42)
     generator = FixedSummaryGenerator()
-    finalizer = SQLiteSessionFinalizer(database_path, generator)
+    finalizer = SQLiteSessionFinalizer(
+        database_path,
+        generator,
+        extraction_store=memory_store,
+    )
 
     first = finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
     second = finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
@@ -269,20 +414,26 @@ def test_incomplete_memory_extraction_blocks_finalization_without_calling_genera
         persona_session_id=lane.session_id,
         content="Wait for extraction",
     )
-    connection = open_state_database(database_path)
-    connection.execute(
-        """
-        INSERT INTO memory_extraction_run (
-            owner_user_id, session_id, source_turn_id, lifecycle_epoch,
-            status, created_at, updated_at
-        ) VALUES (42, ?, ?, 1, ?, 'now', 'now')
-        """,
-        (turn.session_id, turn.id, status),
+    memory_store = SQLiteMemoryStore(database_path)
+    extraction_run = memory_store.ensure_extraction_run(
+        owner_user_id=42,
+        session_id=turn.session_id,
+        source_turn_id=turn.id,
     )
-    connection.commit()
-    connection.close()
+    if status != "pending":
+        memory_store.claim_extraction_run(extraction_run.id, owner_user_id=42)
+    if status == "failed":
+        memory_store.fail_extraction_run(
+            extraction_run.id,
+            owner_user_id=42,
+            error_kind="extractor_failed",
+        )
     generator = FixedSummaryGenerator()
-    finalizer = SQLiteSessionFinalizer(database_path, generator)
+    finalizer = SQLiteSessionFinalizer(
+        database_path,
+        generator,
+        extraction_store=memory_store,
+    )
 
     with pytest.raises(RuntimeError, match="extraction is not complete"):
         finalizer.finalize(session_id=turn.session_id, owner_user_id=42)
