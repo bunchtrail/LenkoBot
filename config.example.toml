@@ -9,5 +9,9 @@ identity_version = 1
 [telegram]
 allowed_user_id = 123456789
 
+[telegram_e2e]
+bot_user_id = 987654321
+bot_username = "lenkobot_test_bot"
+
 [oauth]
 client_id = "b1a00492-073a-47ea-816f-4c329264a828"

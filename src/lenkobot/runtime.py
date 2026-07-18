@@ -2,13 +2,20 @@ import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from getpass import getpass
 import os
 from pathlib import Path
 import tomllib
 
-from .aiogram_adapter import AiogramTelegramResponsePort, run_polling
+from .aiogram_adapter import (
+    AiogramTelegramReplyResponsePort,
+    AiogramTelegramResponsePort,
+    run_polling,
+    verify_bot_identity,
+)
 from .application_service import TelegramApplicationService
 from .context_builder import ContextBuilder
+from .live_smoke import run_live_smoke
 from .memory import SQLiteMemoryStore
 from .oauth_credentials import (
     WindowsOAuthCredentialStore,
@@ -17,6 +24,17 @@ from .oauth_credentials import (
 )
 from .personas import PersonaCatalog
 from .session_store import SQLiteSessionStore
+from .telegram_e2e import (
+    TelegramE2EError,
+    load_telegram_e2e_settings,
+    prepare_telegram_e2e_bot_data_root,
+    run_telegram_e2e,
+)
+from .telegram_e2e_credentials import (
+    TelegramE2ECredentialError,
+    TelegramE2ECredentialState,
+    WindowsTelegramE2ECredentialStore,
+)
 from .telegram_router import RoutedTurn, SQLiteConversationStore, TelegramRouter
 from .xai_provider import (
     CredentialPolicy,
@@ -109,11 +127,55 @@ def login(
     output("OAuth login completed.")
 
 
+def login_telegram_e2e(
+    *,
+    authorize: Callable[..., Awaitable[TelegramE2ECredentialState]],
+    store: WindowsTelegramE2ECredentialStore,
+    expected_user_id: int,
+    input_value: Callable[[str], str] = input,
+    secret_input: Callable[[str], str] = getpass,
+    output: Callable[[str], None] = print,
+) -> None:
+    try:
+        api_id = int(input_value("Telegram API ID: ").strip())
+    except (TypeError, ValueError):
+        raise ValueError("Telegram API ID must be a positive integer") from None
+    if api_id <= 0:
+        raise ValueError("Telegram API ID must be a positive integer")
+    api_hash = secret_input("Telegram API hash: ").strip()
+    if len(api_hash) != 32 or any(
+        character not in "0123456789abcdefABCDEF" for character in api_hash
+    ):
+        raise ValueError("Telegram API hash is invalid")
+    phone = input_value("Test account phone: ").strip()
+    if not phone:
+        raise ValueError("Telegram test account phone cannot be empty")
+
+    state = asyncio.run(
+        authorize(
+            api_id=api_id,
+            api_hash=api_hash,
+            phone=phone,
+            code_provider=lambda: secret_input("Telegram login code: ").strip(),
+            password_provider=lambda: secret_input(
+                "Telegram 2FA password: "
+            ).strip(),
+        )
+    )
+    if state.user_id != expected_user_id:
+        raise ValueError(
+            "Telegram login does not match the configured test user"
+        )
+    store.save(state)
+    output(f"Telegram E2E login completed for test user ID {state.user_id}.")
+
+
 async def run_application(
     settings: RuntimeSettings,
     bot_token: str,
     *,
     polling: Callable[..., Awaitable[None]] = run_polling,
+    response_port_factory: Callable[..., object] = AiogramTelegramResponsePort,
 ) -> None:
     if not isinstance(bot_token, str) or not bot_token.strip():
         raise ValueError("Telegram bot token cannot be empty")
@@ -171,7 +233,7 @@ async def run_application(
         await polling(
             bot_token,
             service,
-            response_port_factory=AiogramTelegramResponsePort,
+            response_port_factory=response_port_factory,
         )
     finally:
         conversation_store.close()
@@ -182,23 +244,125 @@ async def run_application(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lenkobot")
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("login", "run"):
+    e2e_login_parser = commands.add_parser("telegram-e2e-login")
+    e2e_login_parser.add_argument("--config", required=True, type=Path)
+    for command in (
+        "login",
+        "run",
+        "live-smoke",
+        "telegram-e2e",
+        "telegram-e2e-bot",
+    ):
         command_parser = commands.add_parser(command)
         command_parser.add_argument("--config", required=True, type=Path)
         if command == "run":
             command_parser.add_argument("--data-root", type=Path)
+        elif command == "live-smoke":
+            command_parser.add_argument("--data-root", required=True, type=Path)
+            command_parser.add_argument("--confirm-send", action="store_true")
+        elif command == "telegram-e2e":
+            command_parser.add_argument("--confirm-send", action="store_true")
+        elif command == "telegram-e2e-bot":
+            command_parser.add_argument("--data-root", required=True, type=Path)
+            command_parser.add_argument("--confirm-run", action="store_true")
     arguments = parser.parse_args(argv)
 
     try:
-        settings = load_runtime_settings(
-            arguments.config,
-            data_root=getattr(arguments, "data_root", None),
-        )
+        if arguments.command == "telegram-e2e-login":
+            settings = load_telegram_e2e_settings(arguments.config)
+            authorize, _ = _load_telethon_e2e_adapters()
+            login_telegram_e2e(
+                authorize=authorize,
+                store=WindowsTelegramE2ECredentialStore(),
+                expected_user_id=settings.allowed_user_id,
+            )
+        elif arguments.command == "telegram-e2e":
+            settings = load_telegram_e2e_settings(arguments.config)
+            credentials = WindowsTelegramE2ECredentialStore().load()
+            if credentials is None:
+                raise TelegramE2ECredentialError(
+                    "Telegram E2E credential state is unavailable"
+                )
+            _, transport_factory = _load_telethon_e2e_adapters()
+            report = asyncio.run(
+                run_telegram_e2e(
+                    settings,
+                    credentials,
+                    confirmed=arguments.confirm_send,
+                    transport_factory=transport_factory,
+                )
+            )
+            for step in report.steps:
+                print(f"{step.command} -> {step.response_text}")
+            print(
+                "Telegram E2E completed: "
+                f"{report.command_count} replies received and verified."
+            )
+        elif arguments.command == "telegram-e2e-bot":
+            if not arguments.confirm_run:
+                raise ValueError(
+                    "Telegram E2E bot requires explicit run confirmation"
+                )
+            e2e_settings = load_telegram_e2e_settings(arguments.config)
+            bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            asyncio.run(
+                verify_bot_identity(
+                    bot_token,
+                    expected_bot_user_id=e2e_settings.bot_user_id,
+                )
+            )
+            data_root = prepare_telegram_e2e_bot_data_root(
+                arguments.data_root,
+                config_path=arguments.config,
+            )
+            settings = load_runtime_settings(
+                arguments.config,
+                data_root=data_root,
+            )
+            asyncio.run(
+                run_application(
+                    settings,
+                    bot_token,
+                    response_port_factory=AiogramTelegramReplyResponsePort,
+                )
+            )
+        else:
+            settings = load_runtime_settings(
+                arguments.config,
+                data_root=getattr(arguments, "data_root", None),
+            )
         if arguments.command == "login":
             login(settings)
-        else:
+        elif arguments.command == "run":
             bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             asyncio.run(run_application(settings, bot_token))
-    except (CredentialUnavailable, OSError, ProviderRequestError, ValueError) as error:
+        elif arguments.command == "live-smoke":
+            bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            report = asyncio.run(
+                run_live_smoke(
+                    settings,
+                    bot_token,
+                    config_path=arguments.config,
+                    confirmed=arguments.confirm_send,
+                )
+            )
+            print(
+                "Telegram live smoke completed: "
+                f"{report.command_count} commands delivered."
+            )
+    except (
+        CredentialUnavailable,
+        OSError,
+        ProviderRequestError,
+        TelegramE2ECredentialError,
+        TelegramE2EError,
+        ValueError,
+    ) as error:
         parser.error(str(error))
     return 0
+
+
+def _load_telethon_e2e_adapters() -> tuple[Callable[..., object], Callable[..., object]]:
+    from .telethon_e2e import authorize_telethon_user, open_telethon_transport
+
+    return authorize_telethon_user, open_telethon_transport

@@ -1,14 +1,24 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from lenkobot.oauth_credentials import OAuthDeviceAuthorization
-from lenkobot.runtime import login, load_runtime_settings, run_application
+from lenkobot.runtime import (
+    login,
+    load_runtime_settings,
+    login_telegram_e2e,
+    main,
+    run_application,
+)
+from lenkobot.telegram_e2e import TelegramE2EReport, TelegramE2EStep
+from lenkobot.telegram_e2e_credentials import TelegramE2ECredentialState
 from lenkobot.xai_provider import CredentialUnavailable, OAuthTokenState
 
 
 def write_config(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     config_path = tmp_path / "lenkobot.toml"
     config_path.write_text(
         """
@@ -235,3 +245,233 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     assert observed["bot_token"] == "telegram-secret"
     assert isinstance(observed["handler"], TelegramApplicationService)
     assert observed["response_port_factory"] is AiogramTelegramResponsePort
+
+
+def test_main_composes_confirmed_live_smoke_without_oauth(tmp_path, monkeypatch, capsys):
+    import lenkobot.runtime as runtime
+
+    config_path = write_config(tmp_path / "config")
+    data_root = tmp_path / "smoke-state"
+    observed = {}
+
+    async def live_smoke(settings, bot_token, *, config_path, confirmed):
+        observed["settings"] = settings
+        observed["bot_token"] = bot_token
+        observed["config_path"] = config_path
+        observed["confirmed"] = confirmed
+        return SimpleNamespace(command_count=6)
+
+    monkeypatch.setattr(runtime, "run_live_smoke", live_smoke)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-secret")
+
+    result = main(
+        [
+            "live-smoke",
+            "--config",
+            str(config_path),
+            "--data-root",
+            str(data_root),
+            "--confirm-send",
+        ]
+    )
+
+    assert result == 0
+    assert observed["settings"].data_root == data_root
+    assert observed["bot_token"] == "telegram-secret"
+    assert observed["config_path"] == config_path
+    assert observed["confirmed"] is True
+    assert capsys.readouterr().out == "Telegram live smoke completed: 6 commands delivered.\n"
+
+
+def test_telegram_e2e_login_saves_only_successful_redacted_authorization():
+    class RecordingStore:
+        def __init__(self):
+            self.saved = []
+
+        def save(self, state):
+            self.saved.append(state)
+
+    store = RecordingStore()
+    inputs = iter(("12345", "+10000000000"))
+    secrets = iter(("a" * 32, "12345", "two-factor-secret"))
+    output = []
+
+    async def authorize(**kwargs):
+        assert kwargs["api_id"] == 12345
+        assert kwargs["api_hash"] == "a" * 32
+        assert kwargs["phone"] == "+10000000000"
+        assert kwargs["code_provider"]() == "12345"
+        assert kwargs["password_provider"]() == "two-factor-secret"
+        return TelegramE2ECredentialState(
+            api_id=12345,
+            api_hash="a" * 32,
+            session="serialized-session-secret",
+            user_id=555,
+        )
+
+    login_telegram_e2e(
+        authorize=authorize,
+        store=store,
+        expected_user_id=555,
+        input_value=lambda prompt: next(inputs),
+        secret_input=lambda prompt: next(secrets),
+        output=output.append,
+    )
+
+    assert len(store.saved) == 1
+    assert output == ["Telegram E2E login completed for test user ID 555."]
+    assert "serialized-session-secret" not in repr(output)
+    assert "two-factor-secret" not in repr(output)
+
+
+def test_telegram_e2e_login_does_not_overwrite_session_for_wrong_user():
+    class RecordingStore:
+        def __init__(self):
+            self.saved = []
+
+        def save(self, state):
+            self.saved.append(state)
+
+    store = RecordingStore()
+    inputs = iter(("12345", "+10000000000"))
+    secrets = iter(("a" * 32,))
+
+    async def authorize(**kwargs):
+        return TelegramE2ECredentialState(
+            api_id=12345,
+            api_hash="a" * 32,
+            session="wrong-user-session-secret",
+            user_id=999,
+        )
+
+    with pytest.raises(ValueError, match="configured test user"):
+        login_telegram_e2e(
+            authorize=authorize,
+            store=store,
+            expected_user_id=555,
+            input_value=lambda prompt: next(inputs),
+            secret_input=lambda prompt: next(secrets),
+        )
+
+    assert store.saved == []
+
+
+def test_main_runs_telegram_e2e_and_prints_verified_replies(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import lenkobot.runtime as runtime
+
+    config_path = write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n\n[telegram_e2e]\n"
+        + "bot_user_id = 777\n"
+        + 'bot_username = "lenkobot_test_bot"\n',
+        encoding="utf-8",
+    )
+    credentials = TelegramE2ECredentialState(
+        api_id=12345,
+        api_hash="a" * 32,
+        session="serialized-session-secret",
+        user_id=123456789,
+    )
+
+    class CredentialStore:
+        def load(self):
+            return credentials
+
+    async def transport_factory(settings, state):
+        raise AssertionError("run function is stubbed")
+
+    async def e2e_run(settings, state, *, confirmed, transport_factory):
+        assert settings.allowed_user_id == 123456789
+        assert state == credentials
+        assert confirmed is True
+        return TelegramE2EReport(
+            steps=(
+                TelegramE2EStep("/start", "verified help reply"),
+                TelegramE2EStep("/forget", "Удалено: запись <id>."),
+            )
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "WindowsTelegramE2ECredentialStore",
+        CredentialStore,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_load_telethon_e2e_adapters",
+        lambda: (None, transport_factory),
+    )
+    monkeypatch.setattr(runtime, "run_telegram_e2e", e2e_run)
+
+    result = main(
+        [
+            "telegram-e2e",
+            "--config",
+            str(config_path),
+            "--confirm-send",
+        ]
+    )
+
+    assert result == 0
+    assert capsys.readouterr().out == (
+        "/start -> verified help reply\n"
+        "/forget -> Удалено: запись <id>.\n"
+        "Telegram E2E completed: 2 replies received and verified.\n"
+    )
+
+
+def test_main_runs_correlated_e2e_bot_with_fresh_external_state(
+    tmp_path,
+    monkeypatch,
+):
+    import lenkobot.runtime as runtime
+    from lenkobot.aiogram_adapter import AiogramTelegramReplyResponsePort
+
+    config_directory = tmp_path / "config"
+    config_path = write_config(config_directory)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n\n[telegram_e2e]\n"
+        + "bot_user_id = 777\n"
+        + 'bot_username = "lenkobot_test_bot"\n',
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "e2e-state"
+    observed = {}
+
+    async def run(settings, bot_token, *, response_port_factory, **kwargs):
+        assert settings.data_root.is_dir()
+        observed["settings"] = settings
+        observed["bot_token"] = bot_token
+        observed["response_port_factory"] = response_port_factory
+
+    monkeypatch.setattr(runtime, "run_application", run)
+    verified = []
+
+    async def verify(bot_token, *, expected_bot_user_id):
+        verified.append((bot_token, expected_bot_user_id))
+
+    monkeypatch.setattr(runtime, "verify_bot_identity", verify)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-secret")
+
+    result = main(
+        [
+            "telegram-e2e-bot",
+            "--config",
+            str(config_path),
+            "--data-root",
+            str(data_root),
+            "--confirm-run",
+        ]
+    )
+
+    assert result == 0
+    assert observed["settings"].data_root == data_root.resolve()
+    assert observed["bot_token"] == "telegram-secret"
+    assert observed["response_port_factory"] is AiogramTelegramReplyResponsePort
+    assert verified == [("telegram-secret", 777)]

@@ -42,6 +42,13 @@
 - `Confirmed`: официальный xAI Responses structured-output contract передаёт JSON Schema через `text.format` и возвращает JSON в `message/output_text`. Реализация должна оставаться transport-neutral и дополнительно валидировать typed result локально; OAuth bearer для structured request не включается без отдельного non-sensitive live smoke.
 - Phase 2 finalizer генерирует bounded summary вне write transaction, затем повторно проверяет owner lifecycle epoch, неизменность raw-turn snapshot и отсутствие pending/processing/failed extraction. Только после этого одна transaction сохраняет summary, удаляет raw turns и закрывает session; completed extraction outcomes сохраняются, а повторный close возвращает существующую summary без нового provider call.
 - Phase 1 persistence order подтверждён как `user turn -> context/provider -> assistant turn -> delivery`; provider failure не создаёт assistant content, delivery failure не удаляет уже сохранённый assistant result.
+- `Confirmed`: для Phase 0 пользователь выбрал Hermes-style `live-smoke` без MTProto/Telethon и MCP. CLI синтетически проводит фиксированный command corpus через production application/router/memory contracts в новом external data root и реально доставляет ответы только `allowed_user_id` через Bot API; это не считается доказательством long-polling ingress.
+- `Confirmed`: после Hermes-style smoke пользователь уточнил требуемый proof: test user должен реально отправлять сообщения боту через Telegram, а E2E client должен получать и проверять ответы. Полный MTProto E2E добавляется отдельной optional vertical и не меняет смысл существующего `live-smoke`.
+- `Confirmed`: E2E использует отдельный Telegram test user, но временно текущий bot identity. Production poller останавливается; отдельный untracked E2E config pin-ит test-user/bot IDs и запускает bot с fresh external state. Production config/state не переписываются, после проверки обычный poller восстанавливается.
+- `Confirmed`: Telethon `api_hash` и `StringSession` считаются account credentials и хранятся только в отдельном Windows Credential Manager target. CLI не принимает arbitrary target/chat/command, raw replies выводятся только после successful expected-response validation в безопасной нормализованной форме.
+- `Confirmed`: E2E bot использует отдельный reply response port и связывает каждый ответ с конкретным source `message_id`; user-client требует exact `reply_to_msg_id` и отклоняет delayed/duplicate/concurrent dialog activity. Cross-client numeric ID equality остаётся `Assumed` до live proof и при mismatch не заменяется timeout-based эвристикой.
+- `Confirmed`: временный E2E poller до state creation проверяет Bot API `getMe` против pinned bot ID; fresh external root создаётся как новый leaf и повторно resolve-ится до composition. Telethon listener принимает оба направления и отклоняет любое concurrent dialog activity, кроме собственной correlated command/reply пары.
+- `Confirmed`: 19 июля 2026 владелец явно принял setup blocker manual MTProto E2E: отдельный test-user Credential Manager state не настроен, поэтому реальный round-trip не выполняется. Это разрешённый `OR`-вариант Phase 0 gate; implementation и synthetic Bot API evidence остаются обязательными.
 
 ## Находки
 
@@ -69,6 +76,7 @@
 - Stores продолжают открывать отдельные sqlite connections вместо общего process-wide connection. Это сохраняет стандартную thread-bound модель `sqlite3`; общий lifecycle соединений будет собран будущим composition root.
 - Phase 1 не добавляет owner FK в исторический `conversation`: static Telegram authorization знает owner только в runtime, поэтому неподтверждаемый migration backfill был бы ложным. Owner хранится на concrete `session`; multi-surface conversation ownership остаётся отдельной migration до web release.
 - Локальная Phase 1 начата при незакрытом live-smoke gate Phase 0. Это обратимое отклонение допустимо только потому, что blocker внешний, а schema/TDD work не зависит от Telegram secret; Phase 0 не помечена complete.
+- Вместо Telegram user-client Phase 0 использует выбранную владельцем Hermes-style проверку: synthetic owner ingress сочетается с реальным Bot API outbound. Реальный incoming update остаётся принятым ограничением и не подменяется формулировкой полного E2E.
 
 ## Оставшиеся неизвестности
 
@@ -82,7 +90,7 @@
 - WAL, backup/restore и координация нескольких процессов остаются Open. Текущая persistence vertical гарантирует согласованный schema lifecycle и bounded ожидание SQLite lock, но не вводит новый deployment contract.
 - Для export остаются Open конкретный состав managed files, две owner-controlled recovery copies age identity и destructive restore UX. Потеря всех private identities означает необратимую потерю export и не компенсируется скрытым key escrow.
 - Для automatic memory остаются Open окончательная category taxonomy и live OAuth structured-output compatibility. До live gate extraction обязана быть disabled/fail-closed, а confidence остаётся metadata, не разрешением сохранять sensitive data.
-- Phase 0 live smoke остаётся environment blocker: `TELEGRAM_BOT_TOKEN` отсутствует в process, User и Machine environment. Найденный работающий `lenkobot run` был запущен до memory-command vertical, поэтому не доказывает `/remember`, `/memories` и `/forget`; без secret его нельзя безопасно перезапустить из текущего процесса.
+- Реальный Phase 0 long-polling ingress остаётся непроверенным: найденный работающий `lenkobot run` был запущен до memory-command vertical. Пользователь принял этот риск и выбрал Hermes-style synthetic-ingress/real-outbound smoke; CLI реализован, а фактический smoke с `TELEGRAM_BOT_TOKEN` успешно доставил шесть fixed-owner Bot API сообщений.
 
 ## Проверка
 
@@ -142,3 +150,10 @@
 - Phase 1 targeted suite завершился: `39 passed`; полный suite: `107 passed`. `compileall`, `uv lock --check` и `git diff --check` успешны.
 - Read-only copy фактического `data/state.db` успешно мигрирована с schema v3 на v4: IDs `conversation=1`, `persona_session=1`, `persona=1` сохранены, concrete session rows до первого нового turn отсутствуют.
 - Phase 1 feature commit `37ddc26` отправлен в `origin/main`; GitHub Actions run `29590220267` завершил оба job успешно.
+- Красный цикл Hermes-style smoke начался с `ModuleNotFoundError` для отсутствующего `lenkobot.live_smoke` и `ImportError` для отсутствующего fixed-owner Bot API response port.
+- Smoke tests подтверждают fixed `allowed_user_id`, explicit `--confirm-send`, новый external data root, создание/open SQLite до network, последовательные `/start`, `/help`, `/persona`, `/remember`, `/memories`, `/forget`, удаление probe, stop-on-delivery-error и redaction Bot initialization/identity/send failures.
+- После hardening targeted smoke/runtime/adapter suite завершился: `22 passed`; полный suite: `123 passed`. `compileall` и `uv lock --check` успешны.
+- Независимый review сначала выявил лишнее TOCTOU-окно между path validation и SQLite open; после atomic leaf creation, post-create resolve и открытия state до Bot API вызова повторный review закрыл finding в принятой local same-user threat model. Других code/security findings не осталось.
+- Реальный Hermes-style smoke выполнен с новым external data root: `/start`, `/help`, `/persona`, `/remember`, `/memories`, `/forget` завершились как `6 commands delivered`. Это подтверждает Bot API identity/outbound и command/persistence path; long-polling ingress намеренно остаётся непроверенным.
+- MTProto E2E implementation покрывает отдельный Windows Credential Manager state, pinned test-user/current-bot identities, fresh external bot state, Bot API identity preflight, exact reply-to correlation, concurrent-dialog rejection и безопасный normalized report. Финальный независимый review не нашёл high/medium findings.
+- После MTProto E2E vertical полный suite завершился: `150 passed`; `compileall`, `uv lock --check` и `git diff --check` успешны. Локальный E2E config и bot token доступны, но dedicated test-user credential state ещё не сохранён, поэтому реальный long-polling round-trip не выполнялся. Владелец принял этот setup blocker, и Phase 0 закрыта по `OR`-gate.

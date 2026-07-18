@@ -27,7 +27,7 @@ from .xai_provider import (
 
 _CRED_TYPE_GENERIC = 1
 _CRED_PERSIST_LOCAL_MACHINE = 2
-_CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560
+CREDENTIAL_MAX_BLOB_SIZE = 2560
 _ERROR_NOT_FOUND = 1168
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_ABANDONED = 0x00000080
@@ -64,10 +64,13 @@ class CredentialManagerApi(Protocol):
     def write(self, target_name: str, blob: bytes) -> None: ...
 
 
-class _WindowsCredentialManagerApi:
-    def __init__(self) -> None:
+class WindowsCredentialManagerApi:
+    def __init__(self, *, username: str) -> None:
         if sys.platform != "win32":
             raise CredentialUnavailable("Windows Credential Manager is unavailable")
+        if not username.strip():
+            raise ValueError("Windows credential username cannot be empty")
+        self._username = username
         advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
         self._cred_read = advapi32.CredReadW
         self._cred_read.argtypes = (
@@ -118,7 +121,7 @@ class _WindowsCredentialManagerApi:
             ctypes.POINTER(ctypes.c_ubyte),
         )
         credential.Persist = _CRED_PERSIST_LOCAL_MACHINE
-        credential.UserName = "xai-oauth"
+        credential.UserName = self._username
         if not self._cred_write(ctypes.byref(credential), 0):
             error_code = ctypes.get_last_error()
             raise CredentialUnavailable(
@@ -136,7 +139,7 @@ class WindowsOAuthCredentialStore:
         if not _PROFILE_ID_PATTERN.fullmatch(profile_id):
             raise ValueError("OAuth credential profile ID is invalid")
         self._target_name = f"LenkoBot/xai-oauth/v1/{profile_id}"
-        self._api = api or _WindowsCredentialManagerApi()
+        self._api = api or WindowsCredentialManagerApi(username="xai-oauth")
 
     @property
     def target_name(self) -> str:
@@ -153,7 +156,7 @@ class WindowsOAuthCredentialStore:
             ) from None
         if blob is None:
             return None
-        if len(blob) > _CRED_MAX_CREDENTIAL_BLOB_SIZE:
+        if len(blob) > CREDENTIAL_MAX_BLOB_SIZE:
             raise CredentialUnavailable("Stored OAuth credential is too large")
         try:
             payload = json.loads(blob.decode("utf-8"))
@@ -186,7 +189,7 @@ class WindowsOAuthCredentialStore:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        if len(blob) > _CRED_MAX_CREDENTIAL_BLOB_SIZE:
+        if len(blob) > CREDENTIAL_MAX_BLOB_SIZE:
             raise CredentialUnavailable("OAuth credential is too large to store")
         try:
             self._api.write(self._target_name, blob)

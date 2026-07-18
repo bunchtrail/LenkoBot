@@ -5,6 +5,9 @@ __pycache__/
 *.db
 .env
 config.toml
+config.e2e.toml
+*.session
+*.session-journal
 data/
 *.egg-info/
 build/
