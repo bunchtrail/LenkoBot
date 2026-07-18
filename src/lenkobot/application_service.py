@@ -1,7 +1,7 @@
 import asyncio
 from typing import Protocol
 
-from .memory import MemoryRecord, MemoryScope, NewMemory
+from .memory import MemoryExtractionRun, MemoryRecord, MemoryScope, NewMemory
 from .personas import Persona, PersonaCatalog
 from .session_store import FailureStage, TranscriptFailure, TranscriptTurn
 from .telegram_presentation import (
@@ -43,6 +43,14 @@ class MemoryCommandStore(Protocol):
     ) -> tuple[MemoryRecord, ...]: ...
 
     def delete(self, memory_id: int, *, user_id: int) -> bool: ...
+
+    def ensure_extraction_run(
+        self,
+        *,
+        owner_user_id: int,
+        session_id: int,
+        source_turn_id: int,
+    ) -> MemoryExtractionRun: ...
 
 
 class TranscriptStore(Protocol):
@@ -212,6 +220,22 @@ class TelegramApplicationService:
                         chat_id=turn.chat_id,
                         kind=TelegramResponseKind.ERROR,
                         text="Не удалось сохранить ответ. Попробуйте ещё раз.",
+                    )
+                )
+                return None
+        if self._memory_store is not None and user_turn is not None:
+            try:
+                self._memory_store.ensure_extraction_run(
+                    owner_user_id=message.user_id,
+                    session_id=user_turn.session_id,
+                    source_turn_id=user_turn.id,
+                )
+            except Exception:
+                await presenter.send(
+                    TelegramResponse(
+                        chat_id=turn.chat_id,
+                        kind=TelegramResponseKind.ERROR,
+                        text="Не удалось сохранить состояние памяти. Попробуйте ещё раз.",
                     )
                 )
                 return None

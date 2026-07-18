@@ -50,6 +50,7 @@
 - `Confirmed`: временный E2E poller до state creation проверяет Bot API `getMe` против pinned bot ID; fresh external root создаётся как новый leaf и повторно resolve-ится до composition. Telethon listener принимает оба направления и отклоняет любое concurrent dialog activity, кроме собственной correlated command/reply пары.
 - `Confirmed`: 19 июля 2026 владелец явно принял setup blocker manual MTProto E2E: отдельный test-user Credential Manager state не настроен, поэтому реальный round-trip не выполняется. Это разрешённый `OR`-вариант Phase 0 gate; implementation и synthetic Bot API evidence остаются обязательными.
 - `Confirmed`: extraction-run state machine принадлежит memory boundary: `SQLiteMemoryStore` создаёт idempotent run с owner/session/turn provenance и текущим lifecycle epoch, атомарно claim-ит только `pending`, а `completed`, `failed` и `discarded` являются terminal outcomes. Все transitions проверяют owner и active current epoch; `SessionFinalizer` получает extraction gate через явный reader port и не владеет memory SQL.
+- `Confirmed`: один ordinary user/assistant exchange создаёт extraction run после durable assistant turn; `source_turn_id` указывает на user turn, а будущий extractor читает user turn и следующий assistant turn как одну пару. Provider failure не создаёт run; delivery failure оставляет pending run.
 
 ## Находки
 
@@ -160,5 +161,6 @@
 - После MTProto E2E vertical полный suite завершился: `150 passed`; `compileall`, `uv lock --check` и `git diff --check` успешны. Локальный E2E config и bot token доступны, но dedicated test-user credential state ещё не сохранён, поэтому реальный long-polling round-trip не выполнялся. Владелец принял этот setup blocker, и Phase 0 закрыта по `OR`-gate.
 - Phase 0 smoke/E2E feature commit `1052bb7` отправлен в `origin/main`; GitHub Actions run `29662347587` завершил оба job успешно: full tests/quality и migration/security regressions.
 - Phase 2 extraction-run red cycle начался с `ImportError` для отсутствующего state-machine contract. После реализации targeted memory/session suite завершился: `22 passed`; полный suite достиг `156 passed`.
-- Extraction-run contract намеренно не фиксирует retry/backoff, candidate taxonomy, source-turn pair semantics или provider structured-output behavior; это отдельные следующие seams и остаётся `Open`.
+- Extraction-run contract намеренно не фиксирует retry/backoff, candidate taxonomy или provider structured-output behavior; это отдельные следующие seams и остаётся `Open`.
 - Phase 2 extraction-run feature commit `22a8457` отправлен в `origin/main`; GitHub Actions run `29663006850` завершил оба job успешно.
+- Application wiring red cycle добавил `ImportError`/отсутствующий listing contract; после wiring targeted application/memory/session suite завершился: `44 passed`. Проверены source anchor, отсутствие run при provider failure, pending run при delivery failure и redacted error при невозможности создать run.

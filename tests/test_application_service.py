@@ -45,6 +45,11 @@ class FailingSessionStore:
         raise RuntimeError("database-secret")
 
 
+class FailingExtractionStore:
+    def ensure_extraction_run(self, **kwargs):
+        raise RuntimeError("memory-secret")
+
+
 def build_catalog(tmp_path):
     config_path = tmp_path / "personas.toml"
     config_path.write_text(
@@ -187,11 +192,13 @@ def test_provider_failure_keeps_user_turn_and_redacted_failure_record(tmp_path):
         )
     )
     response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(database_path)
     session_store = SQLiteSessionStore(database_path)
     service, router = build_service(
         tmp_path,
         provider,
         response_port,
+        memory_store=memory_store,
         session_store=session_store,
     )
 
@@ -210,6 +217,10 @@ def test_provider_failure_keeps_user_turn_and_redacted_failure_record(tmp_path):
         (failure.stage, failure.error_kind)
         for failure in session_store.list_failures(session_id=active.id, user_id=42)
     ] == [(FailureStage.PROVIDER, "provider_request_failed")]
+    assert memory_store.list_extraction_runs(
+        owner_user_id=42,
+        session_id=active.id,
+    ) == ()
 
 
 def test_transcript_persistence_failure_is_safe_and_skips_provider(tmp_path):
@@ -246,11 +257,13 @@ def test_delivery_failure_keeps_assistant_turn_and_separate_failure(tmp_path):
         )
     )
     response_port = FailingFinalResponsePort()
+    memory_store = SQLiteMemoryStore(database_path)
     session_store = SQLiteSessionStore(database_path)
     service, router = build_service(
         tmp_path,
         provider,
         response_port,
+        memory_store=memory_store,
         session_store=session_store,
     )
 
@@ -271,6 +284,55 @@ def test_delivery_failure_keeps_assistant_turn_and_separate_failure(tmp_path):
     assert [(failure.stage, failure.error_kind) for failure in failures] == [
         (FailureStage.DELIVERY, "telegram_delivery_failed")
     ]
+    runs = memory_store.list_extraction_runs(
+        owner_user_id=42,
+        session_id=active.id,
+    )
+    assert len(runs) == 1
+    assert runs[0].source_turn_id == turns[0].id
+    assert runs[0].status.value == "pending"
+
+
+def test_extraction_run_failure_keeps_assistant_turn_and_returns_safe_error(tmp_path):
+    database_path = tmp_path / "state.db"
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Durable answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    session_store = SQLiteSessionStore(database_path)
+    service, router = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        memory_store=FailingExtractionStore(),
+        session_store=session_store,
+    )
+
+    result = asyncio.run(service.handle(telegram_message("Persist exchange")))
+    lane = router.route(telegram_message("inspect"))
+    active = session_store.ensure_active_session(
+        user_id=42,
+        persona_session_id=lane.session_id,
+    )
+
+    assert result is None
+    assert [turn.content for turn in session_store.list_turns(
+        session_id=active.id,
+        user_id=42,
+    )] == ["Persist exchange", "Durable answer"]
+    assert [(item.kind, item.text) for item in response_port.responses] == [
+        (TelegramResponseKind.STATUS, "Готовлю ответ"),
+        (
+            TelegramResponseKind.ERROR,
+            "Не удалось сохранить состояние памяти. Попробуйте ещё раз.",
+        ),
+    ]
+    assert "memory-secret" not in response_port.responses[-1].text
 
 
 def test_persona_command_switches_lane_without_provider_call(tmp_path):
@@ -566,6 +628,50 @@ def test_application_service_builds_next_prompt_from_durable_recent_transcript(t
     assert "First durable answer" in provider.prompts[1]
     assert provider.prompts[1].count("Second question") == 1
     assert provider.prompts[1].endswith("User message:\nSecond question")
+
+
+def test_completed_exchange_creates_pending_extraction_run_anchored_to_user_turn(
+    tmp_path,
+):
+    database_path = tmp_path / "state.db"
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Durable answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(database_path)
+    session_store = SQLiteSessionStore(database_path)
+    service, router = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        memory_store=memory_store,
+        session_store=session_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("Remember this exchange")))
+    lane = router.route(telegram_message("inspect"))
+    active = session_store.ensure_active_session(
+        user_id=42,
+        persona_session_id=lane.session_id,
+    )
+    turns = session_store.list_turns(session_id=active.id, user_id=42)
+    runs = memory_store.list_extraction_runs(
+        owner_user_id=42,
+        session_id=active.id,
+    )
+
+    assert [(turn.role, turn.content) for turn in turns] == [
+        ("user", "Remember this exchange"),
+        ("assistant", "Durable answer"),
+    ]
+    assert len(runs) == 1
+    assert runs[0].source_turn_id == turns[0].id
+    assert runs[0].status.value == "pending"
 
 
 def test_unauthorized_input_is_rejected_before_context_builder(tmp_path):

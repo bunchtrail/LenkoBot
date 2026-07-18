@@ -287,6 +287,23 @@ class SQLiteMemoryStore:
         ).fetchone()
         return None if row is None else _extraction_run_from_row(row)
 
+    def list_extraction_runs(
+        self,
+        *,
+        owner_user_id: int,
+        session_id: int,
+    ) -> tuple[MemoryExtractionRun, ...]:
+        _validate_positive_ids(owner_user_id, session_id)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM memory_extraction_run
+            WHERE owner_user_id = ? AND session_id = ?
+            ORDER BY id ASC
+            """,
+            (owner_user_id, session_id),
+        ).fetchall()
+        return tuple(_extraction_run_from_row(row) for row in rows)
+
     def claim_extraction_run(
         self,
         run_id: int,

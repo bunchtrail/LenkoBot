@@ -168,6 +168,8 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 - [x] Добавить `memory_extraction_run` migration и state machine.
 - [ ] Добавить `memory_revision` migration и optimistic edit.
 - [x] Добавить owner lifecycle epoch и reset state.
+- [x] Создавать durable extraction run после сохранения user/assistant exchange;
+  `source_turn_id` якорится на user turn.
 - [ ] Реализовать per-turn automatic memory extraction.
 - [ ] Сохранять typed category каждого candidate.
 - [ ] Сохранять provenance turn/session каждого candidate.
