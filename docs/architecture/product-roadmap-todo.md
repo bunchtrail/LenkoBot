@@ -213,8 +213,8 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 
 ### Evidence
 
-- Commits: `22a8457` (state machine), `f16039b` (exchange wiring), Phase 2
-  completion commit pending
+- Commits: `22a8457` (state machine), `f16039b` (exchange wiring), `372b0ef`
+  (Phase 2 completion)
 - Extraction-run targeted tests: `22 passed` (`memory` + `session_store`)
 - Exchange-wiring targeted tests: `44 passed` (`application` + `memory` + `session`)
 - Sensitive-data corpus: `6 regression cases; passed`
@@ -224,6 +224,8 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 - Reset/purge/audit tests: targeted tests passed
 - Full suite after Phase 2: `193 passed`
 - CI runs: `29663006850` and `29663370546` — success
+- Phase 2 hosted CI run: `29665709229` — success (tests/quality and
+  migration/security regressions)
 - Structured OAuth smoke: `grok-4.5`, non-sensitive typed object, no response persisted
 - Runtime prerequisite: `age` executable is not installed on this Windows host; the
   production exporter fails closed until the deployment image provides it.

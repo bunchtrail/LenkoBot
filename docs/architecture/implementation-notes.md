@@ -182,3 +182,4 @@
 - Разрешённый non-sensitive structured OAuth smoke выполнен без persistence: `grok-4.5` вернул typed object response.
 - Финальная local Phase 2 verification: `uv run --locked --python 3.13 --group dev pytest` -> `193 passed`; `python -m compileall -q src tests`, `uv lock --check` и `git diff --check` успешны.
 - Export fixture подтвердил PAX archive с ровно `manifest.json` и `state.db`, recipient validation и consistent SQLite online-backup snapshot. На Windows host отсутствует `age` executable, поэтому production export требует его в deployment environment.
+- Phase 2 completion commit `372b0ef` отправлен в `origin/main`; hosted CI run `29665709229` завершил оба job успешно.
