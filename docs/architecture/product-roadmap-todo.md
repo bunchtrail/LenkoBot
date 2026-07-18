@@ -209,12 +209,13 @@ Roadmap: [Phase 2](product-roadmap.md#phase-2-session-finalization-memory-v2-и-
 
 ### Evidence
 
-- Commit: `pending`
+- Commit: `22a8457`
 - Extraction-run targeted tests: `22 passed` (`memory` + `session_store`)
 - Sensitive-data corpus: `pending`
 - Export fixture: `pending`
 - Reset concurrency tests: `pending`
 - Full suite after seam: `156 passed`
+- CI run: `29663006850` — success
 
 ## Phase 3. Tasks и durable reminders
 

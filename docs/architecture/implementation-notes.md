@@ -161,3 +161,4 @@
 - Phase 0 smoke/E2E feature commit `1052bb7` отправлен в `origin/main`; GitHub Actions run `29662347587` завершил оба job успешно: full tests/quality и migration/security regressions.
 - Phase 2 extraction-run red cycle начался с `ImportError` для отсутствующего state-machine contract. После реализации targeted memory/session suite завершился: `22 passed`; полный suite достиг `156 passed`.
 - Extraction-run contract намеренно не фиксирует retry/backoff, candidate taxonomy, source-turn pair semantics или provider structured-output behavior; это отдельные следующие seams и остаётся `Open`.
+- Phase 2 extraction-run feature commit `22a8457` отправлен в `origin/main`; GitHub Actions run `29663006850` завершил оба job успешно.
