@@ -164,3 +164,4 @@
 - Extraction-run contract намеренно не фиксирует retry/backoff, candidate taxonomy или provider structured-output behavior; это отдельные следующие seams и остаётся `Open`.
 - Phase 2 extraction-run feature commit `22a8457` отправлен в `origin/main`; GitHub Actions run `29663006850` завершил оба job успешно.
 - Application wiring red cycle добавил `ImportError`/отсутствующий listing contract; после wiring targeted application/memory/session suite завершился: `44 passed`. Проверены source anchor, отсутствие run при provider failure, pending run при delivery failure и redacted error при невозможности создать run.
+- Application exchange-wiring commit `f16039b` отправлен в `origin/main`; GitHub Actions run `29663370546` завершил оба job успешно. Полный suite после wiring: `158 passed`.
