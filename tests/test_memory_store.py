@@ -3,11 +3,18 @@ import sqlite3
 import pytest
 
 from lenkobot.memory import (
+    MemoryCategory,
     MemoryLimits,
     MemoryScope,
+    MemorySource,
+    MemoryVersionConflict,
     NewMemory,
     RelationshipVersionConflict,
     SQLiteMemoryStore,
+)
+from lenkobot.memory_extraction import (
+    MemoryCandidate,
+    MemoryCandidatePolicy,
 )
 from lenkobot.personas import Persona
 
@@ -197,6 +204,90 @@ def test_memory_update_cannot_bypass_kind_and_content_constraints(tmp_path):
     unchanged = store.get(record.id, user_id=42)
     assert unchanged.kind == "fact"
     assert unchanged.content == "valid"
+
+
+def test_automatic_memory_persists_category_confidence_and_provenance_with_revision(
+    tmp_path,
+):
+    store = SQLiteMemoryStore(tmp_path / "state.db")
+    record = store.create(
+        NewMemory(
+            user_id=42,
+            scope=MemoryScope.SHARED,
+            kind="fact",
+            content="Initial preference",
+            source=MemorySource.AUTOMATIC,
+            category=MemoryCategory.PREFERENCE,
+            confidence=0.72,
+            provenance_turn_id=11,
+        )
+    )
+
+    assert record.version == 1
+    assert record.source is MemorySource.AUTOMATIC
+    assert record.category is MemoryCategory.PREFERENCE
+    assert record.confidence == 0.72
+    assert record.provenance_turn_id == 11
+
+    updated = store.update(
+        record.id,
+        user_id=42,
+        content="Updated preference",
+        category=MemoryCategory.CONSTRAINT,
+        confidence=0.81,
+        expected_version=1,
+    )
+    revisions = store.list_revisions(record.id, user_id=42)
+
+    assert updated.version == 2
+    assert updated.category is MemoryCategory.CONSTRAINT
+    assert revisions[0].version == 2
+    assert revisions[0].content == "Updated preference"
+    assert revisions[0].confidence == 0.81
+    with pytest.raises(MemoryVersionConflict):
+        store.update(
+            record.id,
+            user_id=42,
+            content="Stale write",
+            expected_version=1,
+        )
+    assert store.get(record.id, user_id=42).content == "Updated preference"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "my password is hunter2",
+        "my bank account number is 12345",
+        "my medical diagnosis is private",
+        "my phone number is +1 555 0100",
+        "my home address is 10 Main Street",
+    ),
+)
+def test_automatic_candidate_policy_denies_sensitive_content(text):
+    candidate = MemoryCandidate(
+        text=text,
+        category=MemoryCategory.FACT,
+        scope=MemoryScope.SHARED,
+        confidence=0.99,
+        evidence_turn_ids=(11,),
+    )
+
+    assert MemoryCandidatePolicy.validate(candidate) is None
+
+
+def test_automatic_candidate_policy_accepts_allowed_typed_candidate():
+    candidate = MemoryCandidate(
+        text="Prefers concise technical answers",
+        category=MemoryCategory.PREFERENCE,
+        scope=MemoryScope.PERSONA_PRIVATE,
+        confidence=0.42,
+        evidence_turn_ids=(11, 12),
+    )
+
+    accepted = MemoryCandidatePolicy.validate(candidate)
+
+    assert accepted == candidate
 
 
 def test_relationship_update_increments_version_and_rejects_stale_write(tmp_path):

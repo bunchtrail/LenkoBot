@@ -74,6 +74,16 @@ def test_load_runtime_settings_uses_hermes_reference_client_when_oauth_override_
     assert settings.oauth_client_id == "b1a00492-073a-47ea-816f-4c329264a828"
 
 
+def test_load_runtime_settings_exposes_only_configured_export_recipient(tmp_path):
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write("\n[export]\nage_recipient = \"age1example\"\n")
+
+    settings = load_runtime_settings(config_path)
+
+    assert settings.export_recipient == "age1example"
+
+
 def test_login_uses_configured_client_and_only_prints_user_visible_data(
     tmp_path,
     monkeypatch,

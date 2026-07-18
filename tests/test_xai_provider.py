@@ -14,6 +14,8 @@ from lenkobot.xai_provider import (
     UrllibJsonHttpClient,
     XaiProvider,
     XaiResponsesTransport,
+    XaiStructuredProvider,
+    XaiStructuredResponse,
     XaiTextResponse,
 )
 
@@ -137,6 +139,111 @@ def test_responses_transport_sends_minimal_request_and_extracts_assistant_text()
             {"model": "grok-4.5", "input": "Hi"},
         )
     ]
+
+
+def test_responses_transport_sends_structured_schema_and_parses_only_output_text():
+    http_client = RecordingHttpClient(
+        HttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "id": "resp-structured",
+                    "model": "grok-4.5",
+                    "output": [
+                        {"type": "reasoning", "content": []},
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"number": 2}',
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    transport = XaiResponsesTransport(http_client=http_client)
+    schema = {
+        "type": "object",
+        "properties": {"number": {"type": "integer"}},
+        "required": ["number"],
+        "additionalProperties": False,
+    }
+
+    result = transport.complete_structured(
+        credential("xai_oauth"),
+        "grok-4.5",
+        "Return the number 2.",
+        schema_name="number_v1",
+        schema=schema,
+    )
+
+    assert result == XaiStructuredResponse(
+        response_id="resp-structured",
+        model="grok-4.5",
+        value={"number": 2},
+        credential_source="xai_oauth",
+    )
+    assert http_client.calls[0][2] == {
+        "model": "grok-4.5",
+        "input": "Return the number 2.",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "number_v1",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+
+
+def test_structured_provider_uses_only_configured_oauth_source():
+    credential_source = StaticCredentialSource(credential("xai_oauth"))
+
+    class StructuredTransport:
+        def __init__(self):
+            self.calls = []
+
+        def complete_structured(
+            self,
+            credential,
+            model,
+            prompt,
+            *,
+            schema_name,
+            schema,
+        ):
+            self.calls.append((credential, model, prompt, schema_name, schema))
+            return XaiStructuredResponse(
+                response_id="resp-1",
+                model=model,
+                value={"ok": True},
+                credential_source=credential.source_identity,
+            )
+
+    transport = StructuredTransport()
+    provider = XaiStructuredProvider(
+        transport,
+        oauth_source=credential_source,
+        model="grok-4.5",
+    )
+    schema = {"type": "object"}
+
+    result = provider.respond(
+        "Return an object.",
+        schema_name="object_v1",
+        schema=schema,
+    )
+
+    assert result.value == {"ok": True}
+    assert credential_source.call_count == 1
+    assert transport.calls[0][0].source_identity == "xai_oauth"
 
 
 def test_responses_transport_rejects_untrusted_or_insecure_credential_host():

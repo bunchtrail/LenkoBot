@@ -4,6 +4,7 @@ from typing import Protocol
 from .memory import MemoryExtractionRun, MemoryRecord, MemoryScope, NewMemory
 from .personas import Persona, PersonaCatalog
 from .session_store import FailureStage, TranscriptFailure, TranscriptTurn
+from .session_store import SessionFinalizer
 from .telegram_presentation import (
     TelegramCommand,
     TelegramResponse,
@@ -79,6 +80,23 @@ class TranscriptStore(Protocol):
         error_kind: str,
     ) -> TranscriptFailure: ...
 
+    def active_session_for_lane(
+        self,
+        *,
+        user_id: int,
+        persona_session_id: int,
+    ) -> object | None: ...
+
+
+class ExtractionService(Protocol):
+    def process_with_retry(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+        max_attempts: int = 3,
+    ) -> object: ...
+
 
 _MEMORY_PAGE_SIZE = 5
 _MAX_REMEMBER_LENGTH = 500
@@ -88,7 +106,8 @@ _COMMAND_HELP = (
     "/persona [key] — выбрать персону.\n"
     "/remember <text> — сохранить общую запись.\n"
     "/memories [page] — показать записи памяти.\n"
-    "/forget <id> — удалить запись памяти."
+    "/forget <id> — удалить запись памяти.\n"
+    "/new — закрыть текущий разговор и начать новый."
 )
 
 
@@ -102,6 +121,8 @@ class TelegramApplicationService:
         context_builder: TurnContextBuilder | None = None,
         memory_store: MemoryCommandStore | None = None,
         session_store: TranscriptStore | None = None,
+        extraction_service: ExtractionService | None = None,
+        session_finalizer: SessionFinalizer | None = None,
     ) -> None:
         self._router = router
         self._persona_catalog = persona_catalog
@@ -110,6 +131,8 @@ class TelegramApplicationService:
         self._context_builder = context_builder
         self._memory_store = memory_store
         self._session_store = session_store
+        self._extraction_service = extraction_service
+        self._session_finalizer = session_finalizer
 
     async def handle(
         self,
@@ -225,7 +248,7 @@ class TelegramApplicationService:
                 return None
         if self._memory_store is not None and user_turn is not None:
             try:
-                self._memory_store.ensure_extraction_run(
+                extraction_run = self._memory_store.ensure_extraction_run(
                     owner_user_id=message.user_id,
                     session_id=user_turn.session_id,
                     source_turn_id=user_turn.id,
@@ -239,6 +262,15 @@ class TelegramApplicationService:
                     )
                 )
                 return None
+            if self._extraction_service is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._extraction_service.process_with_retry,
+                        extraction_run.id,
+                        owner_user_id=message.user_id,
+                    )
+                except Exception:
+                    pass
         try:
             if result.fallback_from is not None:
                 await presenter.send(
@@ -310,6 +342,10 @@ class TelegramApplicationService:
             )
             return None
 
+        if command.name == "new":
+            await self._handle_new(message, command, presenter)
+            return None
+
         if command.name != "persona":
             if command.name == "remember":
                 await self._handle_remember(message, command, presenter)
@@ -372,6 +408,70 @@ class TelegramApplicationService:
             )
         )
         return None
+
+    async def _handle_new(
+        self,
+        message: IncomingTelegramMessage,
+        command: TelegramCommand,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        if command.arguments:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Формат команды: /new.",
+            )
+            return
+        if self._session_store is None or self._session_finalizer is None:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Закрытие разговоров сейчас недоступно.",
+            )
+            return
+        lane = self._router.current_lane(message)
+        if lane is None:
+            await presenter.send(
+                TelegramResponse(
+                    chat_id=message.chat_id,
+                    kind=TelegramResponseKind.FINAL,
+                    text="Активного разговора нет.",
+                )
+            )
+            return
+        active_session = self._session_store.active_session_for_lane(
+            user_id=message.user_id,
+            persona_session_id=lane.session_id,
+        )
+        if active_session is None:
+            await presenter.send(
+                TelegramResponse(
+                    chat_id=message.chat_id,
+                    kind=TelegramResponseKind.FINAL,
+                    text="Активного разговора нет.",
+                )
+            )
+            return
+        try:
+            await asyncio.to_thread(
+                self._session_finalizer.finalize,
+                session_id=active_session.id,
+                owner_user_id=message.user_id,
+            )
+        except Exception:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Не удалось закрыть разговор. Сообщения сохранены, попробуйте ещё раз.",
+            )
+            return
+        await presenter.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text="Разговор закрыт. Следующее сообщение начнёт новый.",
+            )
+        )
 
     async def _handle_remember(
         self,

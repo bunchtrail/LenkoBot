@@ -71,6 +71,15 @@ class SessionFinalizer(Protocol):
     ) -> SessionSummary: ...
 
 
+class ExtractionProcessor(Protocol):
+    def process_for_session(
+        self,
+        *,
+        session_id: int,
+        owner_user_id: int,
+    ) -> None: ...
+
+
 _ERROR_KIND = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
 _MAX_SUMMARY_CHARS = 4_000
 
@@ -82,10 +91,12 @@ class SQLiteSessionFinalizer:
         summary_generator: SummaryGenerator,
         *,
         extraction_store: MemoryExtractionRunReader,
+        extraction_processor: ExtractionProcessor | None = None,
     ) -> None:
         self._connection = open_state_database(database_path)
         self._summary_generator = summary_generator
         self._extraction_store = extraction_store
+        self._extraction_processor = extraction_processor
 
     def finalize(
         self,
@@ -103,6 +114,11 @@ class SQLiteSessionFinalizer:
         )
         lifecycle_epoch = int(session["lifecycle_epoch"])
         turns = self._load_turns(session_id=session_id)
+        if self._extraction_processor is not None:
+            self._extraction_processor.process_for_session(
+                session_id=session_id,
+                owner_user_id=owner_user_id,
+            )
         self._ensure_extraction_gate(
             session_id=session_id,
             owner_user_id=owner_user_id,
@@ -313,6 +329,23 @@ class SQLiteSessionStore:
             raise
         return _active_session_from_row(row)
 
+    def active_session_for_lane(
+        self,
+        *,
+        user_id: int,
+        persona_session_id: int,
+    ) -> ActiveSession | None:
+        row = self._connection.execute(
+            """
+            SELECT id, persona_session_id, owner_user_id, generation, status,
+                opened_at
+            FROM session
+            WHERE persona_session_id = ? AND owner_user_id = ? AND status = 'active'
+            """,
+            (persona_session_id, user_id),
+        ).fetchone()
+        return None if row is None else _active_session_from_row(row)
+
     def begin_user_turn(
         self,
         *,
@@ -466,6 +499,63 @@ class SQLiteSessionStore:
             (session_id, user_id),
         ).fetchall()
         return tuple(_turn_from_row(row) for row in rows)
+
+    def extraction_exchange(
+        self,
+        *,
+        session_id: int,
+        user_id: int,
+        source_turn_id: int,
+    ) -> tuple[TranscriptTurn, TranscriptTurn]:
+        turns = self.list_turns(session_id=session_id, user_id=user_id)
+        for index, turn in enumerate(turns):
+            if turn.id != source_turn_id:
+                continue
+            if turn.role != "user" or index + 1 >= len(turns):
+                break
+            assistant = turns[index + 1]
+            if assistant.role != "assistant":
+                break
+            return turn, assistant
+        raise ValueError("source turn does not have a user/assistant exchange")
+
+    def latest_summary_for_lane(
+        self,
+        *,
+        user_id: int,
+        persona_session_id: int,
+    ) -> SessionSummary | None:
+        row = self._connection.execute(
+            """
+            SELECT summary.*
+            FROM session_summary AS summary
+            JOIN session AS closed_session
+                ON closed_session.id = summary.session_id
+            WHERE summary.owner_user_id = ?
+                AND closed_session.owner_user_id = ?
+                AND closed_session.persona_session_id = ?
+                AND summary.status = 'active'
+            ORDER BY summary.id DESC
+            LIMIT 1
+            """,
+            (user_id, user_id, persona_session_id),
+        ).fetchone()
+        return None if row is None else _summary_from_row(row)
+
+    def persona_key_for_session(self, *, session_id: int, user_id: int) -> str:
+        row = self._connection.execute(
+            """
+            SELECT lane.persona_key
+            FROM session AS active_session
+            JOIN persona_session AS lane
+                ON lane.id = active_session.persona_session_id
+            WHERE active_session.id = ? AND active_session.owner_user_id = ?
+            """,
+            (session_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError("session does not belong to owner")
+        return str(row["persona_key"])
 
     def list_recent_for_context(
         self,

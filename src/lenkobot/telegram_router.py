@@ -95,6 +95,39 @@ class SQLiteConversationStore:
             )
         raise RuntimeError("conversation changed too frequently")
 
+    def current_lane(
+        self,
+        chat_id: int,
+        persona_catalog: PersonaCatalog,
+    ) -> RoutedTurn | None:
+        row = self._connection.execute(
+            """
+            SELECT conversation.id, conversation.active_persona_key,
+                lane.id AS persona_session_id, lane.identity_version
+            FROM conversation
+            JOIN persona_session AS lane
+                ON lane.conversation_id = conversation.id
+                AND lane.persona_key = conversation.active_persona_key
+            WHERE conversation.platform = 'telegram' AND conversation.chat_id = ?
+            ORDER BY lane.id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        persona = persona_catalog.get(str(row["active_persona_key"]))
+        if persona is None:
+            raise ValueError("active persona is not present in catalog")
+        return RoutedTurn(
+            conversation_id=int(row["id"]),
+            chat_id=chat_id,
+            persona_key=persona.key,
+            session_id=int(row["persona_session_id"]),
+            identity_version=int(row["identity_version"]),
+            text="",
+        )
+
     def switch_persona(self, chat_id: int, persona: Persona) -> None:
         self._ensure_conversation(chat_id, persona.key)
         for _ in range(8):
@@ -178,6 +211,11 @@ class TelegramRouter:
             return None
 
         return self._store.route_message(message, self._persona_catalog)
+
+    def current_lane(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
+        if not self.is_authorized(message.user_id, message.chat_type):
+            return None
+        return self._store.current_lane(message.chat_id, self._persona_catalog)
 
     def handle(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
         turn = self.route(message)

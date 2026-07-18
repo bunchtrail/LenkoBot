@@ -446,6 +446,14 @@ class XaiTextResponse:
     fallback_from: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class XaiStructuredResponse:
+    response_id: str | None
+    model: str
+    value: object
+    credential_source: str
+
+
 class CredentialPolicy(StrEnum):
     OAUTH_ONLY = "oauth_only"
     API_KEY_ONLY = "api_key_only"
@@ -463,6 +471,18 @@ class ResponsesTransport(Protocol):
         model: str,
         prompt: str,
     ) -> XaiTextResponse: ...
+
+
+class StructuredResponsesTransport(Protocol):
+    def complete_structured(
+        self,
+        credential: BearerCredential,
+        model: str,
+        prompt: str,
+        *,
+        schema_name: str,
+        schema: dict[str, object],
+    ) -> XaiStructuredResponse: ...
 
 
 class XaiResponsesTransport:
@@ -483,7 +503,75 @@ class XaiResponsesTransport:
         model: str,
         prompt: str,
     ) -> XaiTextResponse:
+        response, body = self._post_response(
+            credential,
+            model,
+            prompt,
+        )
+        text = self._output_text(body, response)
+        response_id = body.get("id")
+        response_model = body.get("model")
+        return XaiTextResponse(
+            response_id=response_id if isinstance(response_id, str) else None,
+            model=response_model if isinstance(response_model, str) else model,
+            text=text,
+            credential_source=credential.source_identity,
+        )
+
+    def complete_structured(
+        self,
+        credential: BearerCredential,
+        model: str,
+        prompt: str,
+        *,
+        schema_name: str,
+        schema: dict[str, object],
+    ) -> XaiStructuredResponse:
+        if not schema_name or not isinstance(schema, dict):
+            raise ValueError("structured response schema is invalid")
+        response, body = self._post_response(
+            credential,
+            model,
+            prompt,
+            response_format={
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": schema,
+                "strict": True,
+            },
+        )
+        text = self._output_text(body, response)
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise ProviderRequestError(
+                "xAI structured response was not valid JSON",
+                status=response.status,
+                code="invalid_structured_response",
+                raw_body=response.body,
+                headers=response.headers,
+            ) from error
+        response_id = body.get("id")
+        response_model = body.get("model")
+        return XaiStructuredResponse(
+            response_id=response_id if isinstance(response_id, str) else None,
+            model=response_model if isinstance(response_model, str) else model,
+            value=value,
+            credential_source=credential.source_identity,
+        )
+
+    def _post_response(
+        self,
+        credential: BearerCredential,
+        model: str,
+        prompt: str,
+        *,
+        response_format: dict[str, object] | None = None,
+    ) -> tuple[HttpResponse, dict[str, object]]:
         endpoint = self._responses_endpoint(credential.base_url)
+        payload: dict[str, object] = {"model": model, "input": prompt}
+        if response_format is not None:
+            payload["text"] = {"format": response_format}
         response = self._http_client.post_json(
             endpoint,
             {
@@ -491,7 +579,7 @@ class XaiResponsesTransport:
                 "Authorization": f"Bearer {credential.token}",
                 "Content-Type": "application/json",
             },
-            {"model": model, "input": prompt},
+            payload,
         )
         body = self._decode_json(response)
         if not 200 <= response.status < 300:
@@ -499,9 +587,11 @@ class XaiResponsesTransport:
             if self._entitlement_classifier is not None and self._entitlement_classifier(error):
                 raise EntitlementDenied.from_error(error)
             raise error
+        return response, body
 
+    @staticmethod
+    def _output_text(body: Mapping[str, object], response: HttpResponse) -> str:
         text_parts = []
-        found_output_text = False
         output = body.get("output", [])
         if isinstance(output, list):
             for item in output:
@@ -517,10 +607,8 @@ class XaiResponsesTransport:
                         continue
                     text = part.get("text")
                     if isinstance(text, str):
-                        found_output_text = True
                         text_parts.append(text)
-
-        if not found_output_text:
+        if not text_parts:
             raise ProviderRequestError(
                 "xAI response contained no assistant output text",
                 status=response.status,
@@ -528,15 +616,7 @@ class XaiResponsesTransport:
                 raw_body=response.body,
                 headers=response.headers,
             )
-
-        response_id = body.get("id")
-        response_model = body.get("model")
-        return XaiTextResponse(
-            response_id=response_id if isinstance(response_id, str) else None,
-            model=response_model if isinstance(response_model, str) else model,
-            text="".join(text_parts),
-            credential_source=credential.source_identity,
-        )
+        return "".join(text_parts)
 
     def _responses_endpoint(self, base_url: str) -> str:
         try:
@@ -651,3 +731,32 @@ class XaiProvider:
             raise CredentialUnavailable("credential source is not configured")
         credential = source.get_credential()
         return self._transport.complete(credential, self._model, prompt)
+
+
+class XaiStructuredProvider:
+    def __init__(
+        self,
+        transport: StructuredResponsesTransport,
+        *,
+        oauth_source: CredentialSource,
+        model: str = "grok-4.5",
+    ) -> None:
+        self._transport = transport
+        self._oauth_source = oauth_source
+        self._model = model
+
+    def respond(
+        self,
+        prompt: str,
+        *,
+        schema_name: str,
+        schema: dict[str, object],
+    ) -> XaiStructuredResponse:
+        credential = self._oauth_source.get_credential()
+        return self._transport.complete_structured(
+            credential,
+            self._model,
+            prompt,
+            schema_name=schema_name,
+            schema=schema,
+        )

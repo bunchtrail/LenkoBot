@@ -23,6 +23,20 @@ class MemoryStatus(StrEnum):
     DELETED = "deleted"
 
 
+class MemorySource(StrEnum):
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+
+
+class MemoryCategory(StrEnum):
+    FACT = "fact"
+    PREFERENCE = "preference"
+    GOAL = "goal"
+    CONSTRAINT = "constraint"
+    RELATIONSHIP = "relationship"
+    EVENT = "event"
+
+
 class ExtractionRunStatus(StrEnum):
     PENDING = "pending"
     PROCESSING = "processing"
@@ -42,6 +56,10 @@ class NewMemory:
     provenance_session_id: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    source: MemorySource | str = MemorySource.MANUAL
+    category: MemoryCategory | str | None = None
+    confidence: float | None = None
+    provenance_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +75,23 @@ class MemoryRecord:
     status: MemoryStatus
     created_at: str
     updated_at: str
+    version: int
+    source: MemorySource
+    category: MemoryCategory | None
+    confidence: float | None
+    provenance_turn_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRevision:
+    id: int
+    memory_id: int
+    owner_user_id: int
+    version: int
+    content: str
+    category: MemoryCategory | None
+    confidence: float | None
+    changed_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +163,10 @@ class RelationshipVersionConflict(RuntimeError):
     pass
 
 
+class MemoryVersionConflict(RuntimeError):
+    pass
+
+
 _EXTRACTION_ERROR_KIND = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
 
 
@@ -180,6 +219,73 @@ class SQLiteMemoryStore:
             (self._profile_id, key),
         ).fetchone()
         return None if row is None else int(row["id"])
+
+    def activate_extraction(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+        memories: tuple[NewMemory, ...],
+    ) -> tuple[MemoryRecord, ...]:
+        for memory in memories:
+            self._normalize_memory_metadata(memory)
+        timestamp = self._timestamp()
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            run = self._connection.execute(
+                """
+                SELECT extraction.*, profile.lifecycle_epoch AS current_epoch,
+                    profile.lifecycle_state AS current_state
+                FROM memory_extraction_run AS extraction
+                JOIN user_profile AS profile
+                    ON profile.user_id = extraction.owner_user_id
+                WHERE extraction.id = ? AND extraction.owner_user_id = ?
+                """,
+                (run_id, owner_user_id),
+            ).fetchone()
+            if run is None:
+                raise KeyError("extraction run not found for owner")
+            if (
+                run["current_state"] != "active"
+                or int(run["current_epoch"]) != int(run["lifecycle_epoch"])
+            ):
+                raise RuntimeError("extraction run is stale")
+            if run["status"] != ExtractionRunStatus.PROCESSING.value:
+                raise RuntimeError("extraction run is not processing")
+            for memory in memories:
+                if memory.user_id != owner_user_id:
+                    raise PermissionError("automatic memory owner does not match run")
+                if MemorySource(memory.source) is not MemorySource.AUTOMATIC:
+                    raise ValueError("extraction activation requires automatic memory")
+                if memory.provenance_session_id != int(run["session_id"]):
+                    raise ValueError("automatic memory session provenance does not match run")
+                if memory.provenance_turn_id != int(run["source_turn_id"]):
+                    raise ValueError("automatic memory turn provenance does not match run")
+            rows = tuple(
+                self._create_in_transaction(memory, timestamp=timestamp)
+                for memory in memories
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE memory_extraction_run
+                SET status = 'completed', error_kind = NULL, updated_at = ?
+                WHERE id = ? AND owner_user_id = ? AND status = 'processing'
+                    AND lifecycle_epoch = ?
+                """,
+                (
+                    timestamp,
+                    run_id,
+                    owner_user_id,
+                    int(run["lifecycle_epoch"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("extraction run completion was lost")
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return tuple(self._memory_from_row(row) for row in rows)
 
     def ensure_relationship(self, *, user_id: int, persona_id: int) -> Relationship:
         timestamp = self._timestamp()
@@ -320,6 +426,32 @@ class SQLiteMemoryStore:
             conflict_message="extraction run is not claimable",
         )
 
+    def retry_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+        max_attempts: int,
+    ) -> MemoryExtractionRun:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        run = self.get_extraction_run(run_id, owner_user_id=owner_user_id)
+        if run is None:
+            raise KeyError("extraction run not found for owner")
+        if run.status is not ExtractionRunStatus.FAILED:
+            raise RuntimeError("only failed extraction runs can be retried")
+        if run.attempt >= max_attempts:
+            raise RuntimeError("extraction retry budget is exhausted")
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.FAILED,
+            status=ExtractionRunStatus.PENDING,
+            attempt_increment=0,
+            error_kind=None,
+            conflict_message="extraction run is not retryable",
+        )
+
     def complete_extraction_run(
         self,
         run_id: int,
@@ -451,17 +583,44 @@ class SQLiteMemoryStore:
         return updated
 
     def create(self, memory: NewMemory) -> MemoryRecord:
-        scope = MemoryScope(memory.scope)
+        self._normalize_memory_metadata(memory)
         created_at = memory.created_at or self._timestamp()
-        updated_at = memory.updated_at or created_at
         with self._connection:
-            cursor = self._connection.execute(
+            row = self._create_in_transaction(memory, timestamp=created_at)
+        return self._memory_from_row(row)
+
+    def _create_in_transaction(
+        self,
+        memory: NewMemory,
+        *,
+        timestamp: str,
+    ) -> sqlite3.Row:
+        scope = MemoryScope(memory.scope)
+        source = MemorySource(memory.source)
+        category = None if memory.category is None else MemoryCategory(memory.category)
+        created_at = memory.created_at or timestamp
+        updated_at = memory.updated_at or created_at
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO user_profile (user_id, created_at)
+            VALUES (?, ?)
+            """,
+            (memory.user_id, created_at),
+        )
+        if source is MemorySource.AUTOMATIC:
+            existing = self._connection.execute(
                 """
-                INSERT INTO memory (
-                    user_id, scope, persona_id, relationship_id, kind, content,
-                    provenance_session_id, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                SELECT
+                    id, user_id, scope, persona_id, relationship_id, kind,
+                    content, provenance_session_id, status, created_at,
+                    updated_at, version, source, category, confidence,
+                    provenance_turn_id
+                FROM memory
+                WHERE user_id = ? AND scope = ? AND persona_id IS ?
+                    AND relationship_id IS ? AND kind = ? AND content = ?
+                    AND provenance_session_id IS ? AND status = 'active'
+                    AND source = 'automatic' AND category = ?
+                    AND confidence IS ? AND provenance_turn_id = ?
                 """,
                 (
                     memory.user_id,
@@ -471,14 +630,54 @@ class SQLiteMemoryStore:
                     memory.kind,
                     memory.content,
                     memory.provenance_session_id,
-                    created_at,
-                    updated_at,
+                    None if category is None else category.value,
+                    memory.confidence,
+                    memory.provenance_turn_id,
                 ),
+            ).fetchone()
+            if existing is not None:
+                return existing
+        cursor = self._connection.execute(
+            """
+            INSERT INTO memory (
+                user_id, scope, persona_id, relationship_id, kind, content,
+                provenance_session_id, status, created_at, updated_at,
+                version, source, category, confidence, provenance_turn_id
             )
-            row = self._select_memory(cursor.lastrowid, memory.user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (
+                memory.user_id,
+                scope.value,
+                memory.persona_id,
+                memory.relationship_id,
+                memory.kind,
+                memory.content,
+                memory.provenance_session_id,
+                created_at,
+                updated_at,
+                source.value,
+                None if category is None else category.value,
+                memory.confidence,
+                memory.provenance_turn_id,
+            ),
+        )
+        row = self._select_memory(cursor.lastrowid, memory.user_id)
         if row is None:
             raise RuntimeError("memory record was not created")
-        return self._memory_from_row(row)
+        return row
+
+    @staticmethod
+    def _normalize_memory_metadata(memory: NewMemory) -> None:
+        MemoryScope(memory.scope)
+        source = MemorySource(memory.source)
+        category = None if memory.category is None else MemoryCategory(memory.category)
+        _validate_memory_metadata(
+            source=source,
+            category=category,
+            confidence=memory.confidence,
+            provenance_turn_id=memory.provenance_turn_id,
+        )
 
     def get(self, memory_id: int, *, user_id: int) -> MemoryRecord | None:
         row = self._select_memory(memory_id, user_id)
@@ -500,7 +699,8 @@ class SQLiteMemoryStore:
             """
             SELECT
                 id, user_id, scope, persona_id, relationship_id, kind, content,
-                provenance_session_id, status, created_at, updated_at
+                provenance_session_id, status, created_at, updated_at,
+                version, source, category, confidence, provenance_turn_id
             FROM memory
             WHERE user_id = ? AND status = 'active'
             ORDER BY updated_at DESC, id DESC
@@ -517,29 +717,109 @@ class SQLiteMemoryStore:
         user_id: int,
         content: str,
         kind: str | None = None,
+        category: MemoryCategory | str | None = None,
+        confidence: float | None = None,
+        expected_version: int | None = None,
     ) -> MemoryRecord:
         current = self.get(memory_id, user_id=user_id)
         if current is None:
             raise KeyError("memory record not found")
-        with self._connection:
+        selected_category = (
+            current.category if category is None else MemoryCategory(category)
+        )
+        selected_confidence = (
+            current.confidence if confidence is None else confidence
+        )
+        _validate_memory_metadata(
+            source=current.source,
+            category=selected_category,
+            confidence=selected_confidence,
+            provenance_turn_id=current.provenance_turn_id,
+        )
+        expected = current.version if expected_version is None else expected_version
+        timestamp = self._timestamp()
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
                 """
+                INSERT OR IGNORE INTO user_profile (user_id, created_at)
+                VALUES (?, ?)
+                """,
+                (user_id, timestamp),
+            )
+            cursor = self._connection.execute(
+                """
                 UPDATE memory
-                SET kind = ?, content = ?, updated_at = ?
-                WHERE id = ? AND user_id = ? AND status = 'active'
+                SET kind = ?, content = ?, category = ?, confidence = ?,
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'active' AND version = ?
                 """,
                 (
                     current.kind if kind is None else kind,
                     content,
-                    self._timestamp(),
+                    None if selected_category is None else selected_category.value,
+                    selected_confidence,
+                    timestamp,
                     memory_id,
                     user_id,
+                    expected,
                 ),
             )
-        updated = self.get(memory_id, user_id=user_id)
-        if updated is None:
-            raise RuntimeError("memory record disappeared after update")
-        return updated
+            if cursor.rowcount == 0:
+                raise MemoryVersionConflict("memory version changed")
+            updated = self._connection.execute(
+                """
+                SELECT
+                    id, user_id, scope, persona_id, relationship_id, kind, content,
+                    provenance_session_id, status, created_at, updated_at,
+                    version, source, category, confidence, provenance_turn_id
+                FROM memory WHERE id = ?
+                """,
+                (memory_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("memory record disappeared after update")
+            self._connection.execute(
+                """
+                INSERT INTO memory_revision (
+                    memory_id, owner_user_id, version, content, category,
+                    confidence, changed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    user_id,
+                    int(updated["version"]),
+                    str(updated["content"]),
+                    updated["category"],
+                    updated["confidence"],
+                    timestamp,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return self._memory_from_row(updated)
+
+    def list_revisions(
+        self,
+        memory_id: int,
+        *,
+        user_id: int,
+    ) -> tuple[MemoryRevision, ...]:
+        _validate_positive_ids(memory_id, user_id)
+        rows = self._connection.execute(
+            """
+            SELECT id, memory_id, owner_user_id, version, content, category,
+                confidence, changed_at
+            FROM memory_revision
+            WHERE memory_id = ? AND owner_user_id = ?
+            ORDER BY version ASC
+            """,
+            (memory_id, user_id),
+        ).fetchall()
+        return tuple(_revision_from_row(row) for row in rows)
 
     def delete(self, memory_id: int, *, user_id: int) -> bool:
         with self._connection:
@@ -548,6 +828,23 @@ class SQLiteMemoryStore:
                 (memory_id, user_id),
             )
         return cursor.rowcount == 1
+
+    def delete_by_provenance_turn(
+        self,
+        source_turn_id: int,
+        *,
+        user_id: int,
+    ) -> int:
+        _validate_positive_ids(source_turn_id, user_id)
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM memory
+                WHERE provenance_turn_id = ? AND user_id = ?
+                """,
+                (source_turn_id, user_id),
+            )
+        return cursor.rowcount
 
     def promote_to_shared(self, memory_id: int, *, user_id: int) -> MemoryRecord:
         with self._connection:
@@ -704,7 +1001,8 @@ class SQLiteMemoryStore:
             SELECT
                 m.id, m.user_id, m.scope, m.persona_id, m.relationship_id,
                 m.kind, m.content, m.provenance_session_id, m.status,
-                m.created_at, m.updated_at
+                m.created_at, m.updated_at, m.version, m.source, m.category,
+                m.confidence, m.provenance_turn_id
             FROM memory AS m
             WHERE m.status = 'active' AND {where_clause}
             ORDER BY m.updated_at DESC, m.id DESC
@@ -719,7 +1017,8 @@ class SQLiteMemoryStore:
             """
             SELECT
                 id, user_id, scope, persona_id, relationship_id, kind, content,
-                provenance_session_id, status, created_at, updated_at
+                provenance_session_id, status, created_at, updated_at,
+                version, source, category, confidence, provenance_turn_id
             FROM memory
             WHERE id = ? AND user_id = ? AND status = 'active'
             """,
@@ -740,6 +1039,17 @@ class SQLiteMemoryStore:
             status=MemoryStatus(row["status"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            version=int(row["version"]),
+            source=MemorySource(row["source"]),
+            category=(
+                None
+                if row["category"] is None
+                else MemoryCategory(row["category"])
+            ),
+            confidence=(
+                None if row["confidence"] is None else float(row["confidence"])
+            ),
+            provenance_turn_id=row["provenance_turn_id"],
         )
 
     @staticmethod
@@ -761,6 +1071,42 @@ class SQLiteMemoryStore:
 def _validate_positive_ids(*values: int) -> None:
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
         raise ValueError("memory extraction identifiers must be positive integers")
+
+
+def _validate_memory_metadata(
+    *,
+    source: MemorySource,
+    category: MemoryCategory | None,
+    confidence: float | None,
+    provenance_turn_id: int | None,
+) -> None:
+    if source is MemorySource.AUTOMATIC and category is None:
+        raise ValueError("automatic memory requires a category")
+    if confidence is not None and (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (float, int))
+        or not 0.0 <= confidence <= 1.0
+    ):
+        raise ValueError("memory confidence must be between 0 and 1")
+    if provenance_turn_id is not None:
+        _validate_positive_ids(provenance_turn_id)
+    if source is MemorySource.AUTOMATIC and provenance_turn_id is None:
+        raise ValueError("automatic memory requires turn provenance")
+
+
+def _revision_from_row(row: sqlite3.Row) -> MemoryRevision:
+    return MemoryRevision(
+        id=int(row["id"]),
+        memory_id=int(row["memory_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        version=int(row["version"]),
+        content=str(row["content"]),
+        category=(
+            None if row["category"] is None else MemoryCategory(row["category"])
+        ),
+        confidence=(None if row["confidence"] is None else float(row["confidence"])),
+        changed_at=str(row["changed_at"]),
+    )
 
 
 def _extraction_run_from_row(row: sqlite3.Row) -> MemoryExtractionRun:

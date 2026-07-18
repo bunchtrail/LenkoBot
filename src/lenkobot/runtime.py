@@ -17,13 +17,15 @@ from .application_service import TelegramApplicationService
 from .context_builder import ContextBuilder
 from .live_smoke import run_live_smoke
 from .memory import SQLiteMemoryStore
+from .memory_extraction import MemoryExtractionService
 from .oauth_credentials import (
     WindowsOAuthCredentialStore,
     WindowsOAuthRefreshMutex,
     XaiOAuthDeviceClient,
 )
 from .personas import PersonaCatalog
-from .session_store import SQLiteSessionStore
+from .session_store import SQLiteSessionFinalizer, SQLiteSessionStore
+from .session_summary import XaiSummaryGenerator
 from .telegram_e2e import (
     TelegramE2EError,
     load_telegram_e2e_settings,
@@ -45,6 +47,7 @@ from .xai_provider import (
     XaiOAuthRefreshClient,
     XaiProvider,
     XaiResponsesTransport,
+    XaiStructuredProvider,
 )
 
 
@@ -59,6 +62,7 @@ class RuntimeSettings:
     allowed_user_id: int
     oauth_client_id: str
     persona_catalog: PersonaCatalog
+    export_recipient: str | None = None
 
 
 class _DiscardingReplyPort:
@@ -77,10 +81,13 @@ def load_runtime_settings(
 
     telegram = data.get("telegram")
     oauth = data.get("oauth")
+    export = data.get("export")
     if not isinstance(telegram, dict):
         raise ValueError("runtime configuration must contain a telegram table")
     if oauth is not None and not isinstance(oauth, dict):
         raise ValueError("runtime configuration oauth value must be a table")
+    if export is not None and not isinstance(export, dict):
+        raise ValueError("runtime configuration export value must be a table")
 
     allowed_user_id = telegram.get("allowed_user_id")
     if (
@@ -98,6 +105,15 @@ def load_runtime_settings(
     if not isinstance(client_id, str) or not client_id.strip():
         raise ValueError("OAuth client_id cannot be empty")
 
+    export_recipient = export.get("age_recipient") if isinstance(export, dict) else None
+    if export_recipient is not None and (
+        not isinstance(export_recipient, str)
+        or not export_recipient.startswith("age1")
+        or len(export_recipient) < 10
+        or any(character.isspace() for character in export_recipient)
+    ):
+        raise ValueError("export age_recipient is invalid")
+
     try:
         persona_catalog = PersonaCatalog.from_toml(path)
     except (KeyError, TypeError, ValueError) as error:
@@ -109,6 +125,7 @@ def load_runtime_settings(
         allowed_user_id=allowed_user_id,
         oauth_client_id=client_id,
         persona_catalog=persona_catalog,
+        export_recipient=export_recipient,
     )
 
 
@@ -190,10 +207,17 @@ async def run_application(
         XaiOAuthRefreshClient(client_id=settings.oauth_client_id),
         lock=lock,
     )
+    transport = XaiResponsesTransport()
+    oauth_source = OAuthCredentialSource(coordinator, base_url=_INFERENCE_BASE_URL)
     provider = XaiProvider(
-        XaiResponsesTransport(),
+        transport,
         CredentialPolicy.OAUTH_ONLY,
-        oauth_source=OAuthCredentialSource(coordinator, base_url=_INFERENCE_BASE_URL),
+        oauth_source=oauth_source,
+        model=_MODEL,
+    )
+    structured_provider = XaiStructuredProvider(
+        transport,
+        oauth_source=oauth_source,
         model=_MODEL,
     )
 
@@ -211,6 +235,17 @@ async def run_application(
         conversation_store.close()
         memory_store.close()
         raise
+    extraction_service = MemoryExtractionService(
+        memory_store,
+        session_store,
+        structured_provider,
+    )
+    session_finalizer = SQLiteSessionFinalizer(
+        database_path,
+        XaiSummaryGenerator(structured_provider),
+        extraction_store=memory_store,
+        extraction_processor=extraction_service,
+    )
 
     router = TelegramRouter(
         settings.allowed_user_id,
@@ -228,6 +263,8 @@ async def run_application(
         ),
         memory_store=memory_store,
         session_store=session_store,
+        extraction_service=extraction_service,
+        session_finalizer=session_finalizer,
     )
     try:
         await polling(

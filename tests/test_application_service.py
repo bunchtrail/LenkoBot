@@ -6,7 +6,11 @@ from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
 from lenkobot.personas import PersonaCatalog
-from lenkobot.session_store import FailureStage, SQLiteSessionStore
+from lenkobot.session_store import (
+    FailureStage,
+    SQLiteSessionFinalizer,
+    SQLiteSessionStore,
+)
 from lenkobot.telegram_presentation import TelegramResponseKind
 from lenkobot.telegram_router import IncomingTelegramMessage, SQLiteConversationStore, TelegramRouter
 from lenkobot.xai_provider import ProviderRequestError, XaiTextResponse
@@ -50,6 +54,15 @@ class FailingExtractionStore:
         raise RuntimeError("memory-secret")
 
 
+class FixedSummaryGenerator:
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, *, turns):
+        self.calls += 1
+        return "A bounded summary"
+
+
 def build_catalog(tmp_path):
     config_path = tmp_path / "personas.toml"
     config_path.write_text(
@@ -81,6 +94,8 @@ def build_service(
     context_builder=None,
     memory_store=None,
     session_store=None,
+    extraction_service=None,
+    session_finalizer=None,
 ):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
@@ -97,6 +112,8 @@ def build_service(
         context_builder=context_builder,
         memory_store=memory_store,
         session_store=session_store,
+        extraction_service=extraction_service,
+        session_finalizer=session_finalizer,
     ), router
 
 
@@ -427,6 +444,59 @@ def test_start_and_help_return_command_index_without_provider_call(tmp_path, com
     assert "/remember <text>" in response_port.responses[0].text
     assert "/memories [page]" in response_port.responses[0].text
     assert "/forget <id>" in response_port.responses[0].text
+
+
+def test_new_closes_current_session_and_next_turn_uses_summary(tmp_path):
+    database_path = tmp_path / "state.db"
+    memory_store = SQLiteMemoryStore(database_path)
+    session_store = SQLiteSessionStore(database_path)
+    summary_generator = FixedSummaryGenerator()
+    finalizer = SQLiteSessionFinalizer(
+        database_path,
+        summary_generator,
+        extraction_store=memory_store,
+    )
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = RecordingResponsePort()
+    service, router = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        context_builder=ContextBuilder(memory_store, transcript_store=session_store),
+        memory_store=memory_store,
+        session_store=session_store,
+        session_finalizer=finalizer,
+    )
+
+    asyncio.run(service.handle(telegram_message("First")))
+    lane = router.route(telegram_message("inspect"))
+    run = memory_store.list_extraction_runs(
+        owner_user_id=42,
+        session_id=session_store.ensure_active_session(
+            user_id=42,
+            persona_session_id=lane.session_id,
+        ).id,
+    )[0]
+    memory_store.claim_extraction_run(run.id, owner_user_id=42)
+    memory_store.complete_extraction_run(run.id, owner_user_id=42)
+
+    asyncio.run(service.handle(telegram_message("/new")))
+    asyncio.run(service.handle(telegram_message("Next")))
+
+    assert summary_generator.calls == 1
+    assert response_port.responses[2].text == (
+        "Разговор закрыт. Следующее сообщение начнёт новый."
+    )
+    assert "UNTRUSTED CLOSED SESSION SUMMARY" in provider.prompts[-1]
+    assert "A bounded summary" in provider.prompts[-1]
+    assert provider.prompts[-1].endswith("User message:\nNext")
 
 
 def test_memory_commands_create_list_and_delete_only_owned_shared_records(tmp_path):

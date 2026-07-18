@@ -341,7 +341,7 @@ CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 
 
 def open_state_database(database_path: Path | str) -> sqlite3.Connection:
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
