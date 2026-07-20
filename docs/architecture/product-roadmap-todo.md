@@ -355,7 +355,7 @@ Depends on: Phase 2 reset/lifecycle boundary.
 
 ### Evidence
 
-- Commit: `pending`
+- Search-slice commit: `7534117`
 - Recurrence decision: `pending`
 - Crash/restart suite: `pending`
 - Full suite: `pending`

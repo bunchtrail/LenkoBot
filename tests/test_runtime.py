@@ -140,10 +140,15 @@ def test_open_local_application_requires_tavily_key_from_environment(
         def load(self):
             return token_state()
 
+    class FakeMutex:
+        def __init__(self, *args, **kwargs):
+            pass
+
     config_path = write_config(tmp_path)
     with config_path.open("a", encoding="utf-8") as config_file:
         config_file.write('\n[web_search]\nprovider = "tavily"\n')
     monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
+    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     with pytest.raises(CredentialUnavailable, match="Tavily API key"):
