@@ -356,6 +356,7 @@ Depends on: Phase 2 reset/lifecycle boundary.
 ### Evidence
 
 - Search-slice commit: `7534117`
+- Hosted CI: run `29784767023` successful after Linux test fix `244271c`
 - Recurrence decision: `pending`
 - Crash/restart suite: `pending`
 - Full suite: `pending`
