@@ -2,6 +2,7 @@ from lenkobot.telegram_presentation import (
     TELEGRAM_COMMANDS,
     TelegramCommand,
     TelegramInlineButton,
+    TelegramWebSource,
     TelegramSentMessage,
     confirmation_callback_data,
     forget_callback_data,
@@ -12,6 +13,7 @@ from lenkobot.telegram_presentation import (
     parse_persona_callback_data,
     parse_telegram_command,
     persona_callback_data,
+    render_sources_html,
     split_telegram_text,
 )
 
@@ -67,6 +69,29 @@ def test_sent_message_handle_is_transport_neutral():
 
     assert handle.chat_id == 500
     assert handle.message_id == 42
+
+
+def test_sources_html_is_bounded_escaped_and_deduplicated():
+    rendered = render_sources_html(
+        (
+            TelegramWebSource(
+                title='<Fresh & "safe">',
+                url="https://example.com/current?a=1&b=2",
+            ),
+            TelegramWebSource(
+                title="Duplicate",
+                url="https://example.com/current?a=1&b=2",
+            ),
+            TelegramWebSource(title="Unsafe", url="javascript:alert(1)"),
+        )
+    )
+
+    assert rendered.startswith("<b>Источники:</b>\n")
+    assert '&lt;Fresh &amp; &quot;safe&quot;&gt;' in rendered
+    assert 'href="https://example.com/current?a=1&amp;b=2"' in rendered
+    assert "Duplicate" not in rendered
+    assert "Unsafe" not in rendered
+    assert len(rendered) <= 4096
 
 
 def test_confirmation_callback_payload_roundtrip_and_rejects_foreign_data():

@@ -6,16 +6,20 @@ from lenkobot.xai_provider import (
     ApiKeyCredentialSource,
     BearerCredential,
     CredentialPolicy,
+    CredentialUnavailable,
     EntitlementDenied,
     HttpResponse,
     ProviderRequestError,
     UntrustedInferenceHost,
     UrllibJsonHttpClient,
+    XaiFunctionCall,
     XaiProvider,
     XaiResponsesTransport,
     XaiStructuredProvider,
     XaiStructuredResponse,
     XaiTextResponse,
+    XaiToolOutput,
+    XaiToolTurn,
 )
 
 
@@ -60,6 +64,50 @@ class SequenceTransport:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class RecordingToolTransport:
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.tool_calls = []
+        self.output_calls = []
+
+    def complete_with_tools(self, credential, model, prompt, *, tools):
+        self.tool_calls.append((credential, model, prompt, tools))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def complete_with_tool_output(
+        self,
+        credential,
+        model,
+        *,
+        previous_response_id,
+        tool_outputs,
+        tools,
+    ):
+        self.output_calls.append(
+            (credential, model, previous_response_id, tool_outputs, tools)
+        )
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+_WEB_SEARCH_TOOL = {
+    "type": "function",
+    "name": "web_search",
+    "description": "Search the public web for current information.",
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
 
 
 def credential(source_identity, token="secret-token"):
@@ -435,3 +483,263 @@ def test_urllib_client_serializes_json_and_preserves_response_metadata(monkeypat
         "input": "Hi",
     }
     assert observed["timeout"] == 12
+
+def test_complete_with_tools_sends_tools_and_parses_function_call():
+    http_client = RecordingHttpClient(
+        HttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "id": "resp-9",
+                    "model": "grok-4.5",
+                    "output": [
+                        {"type": "reasoning", "content": []},
+                        {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "web_search",
+                            "arguments": '{"query":"usd rub rate"}',
+                            "status": "completed",
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    transport = XaiResponsesTransport(http_client=http_client)
+
+    turn = transport.complete_with_tools(
+        credential("xai_oauth"),
+        "grok-4.5",
+        "курс доллара?",
+        tools=(_WEB_SEARCH_TOOL,),
+    )
+
+    _, _, payload = http_client.calls[0]
+    assert payload["tools"] == [_WEB_SEARCH_TOOL]
+    assert payload["parallel_tool_calls"] is False
+    assert payload["input"] == "курс доллара?"
+    assert turn.response_id == "resp-9"
+    assert turn.text is None
+    assert turn.credential_source == "xai_oauth"
+    assert turn.fallback_from is None
+    assert len(turn.tool_calls) == 1
+    call = turn.tool_calls[0]
+    assert call.call_id == "call-1"
+    assert call.name == "web_search"
+    assert call.arguments == '{"query":"usd rub rate"}'
+
+
+def test_complete_with_tools_returns_text_turn_when_model_answers():
+    http_client = RecordingHttpClient(
+        HttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "id": "resp-10",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "привет"},
+                            ],
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    transport = XaiResponsesTransport(http_client=http_client)
+
+    turn = transport.complete_with_tools(
+        credential("xai_oauth"),
+        "grok-4.5",
+        "привет",
+        tools=(_WEB_SEARCH_TOOL,),
+    )
+
+    assert turn.text == "привет"
+    assert turn.model == "grok-4.5"
+    assert turn.tool_calls == ()
+
+
+def test_complete_with_tool_output_sends_continuation_payload():
+    http_client = RecordingHttpClient(
+        HttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "id": "resp-11",
+                    "model": "grok-4.5",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "курс 80"},
+                            ],
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    transport = XaiResponsesTransport(http_client=http_client)
+
+    turn = transport.complete_with_tool_output(
+        credential("xai_oauth"),
+        "grok-4.5",
+        previous_response_id="resp-9",
+        tool_outputs=(
+            XaiToolOutput(call_id="call-1", output='{"results": []}'),
+        ),
+        tools=(_WEB_SEARCH_TOOL,),
+    )
+
+    _, _, payload = http_client.calls[0]
+    assert payload["previous_response_id"] == "resp-9"
+    assert payload["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"results": []}',
+        }
+    ]
+    assert payload["tools"] == [_WEB_SEARCH_TOOL]
+    assert payload["parallel_tool_calls"] is False
+    assert turn.response_id == "resp-11"
+    assert turn.text == "курс 80"
+
+
+def test_tool_turn_without_text_or_calls_raises_invalid_response():
+    http_client = RecordingHttpClient(
+        HttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps({"id": "resp-12", "model": "grok-4.5", "output": []}),
+        )
+    )
+    transport = XaiResponsesTransport(http_client=http_client)
+
+    with pytest.raises(ProviderRequestError) as exc_info:
+        transport.complete_with_tools(
+            credential("xai_oauth"),
+            "grok-4.5",
+            "hi",
+            tools=(_WEB_SEARCH_TOOL,),
+        )
+
+    assert exc_info.value.code == "invalid_response"
+
+
+def test_tool_turn_rejects_invalid_arguments():
+    transport = XaiResponsesTransport(http_client=RecordingHttpClient(None))
+
+    with pytest.raises(ValueError):
+        transport.complete_with_tools(
+            credential("xai_oauth"), "grok-4.5", "hi", tools=()
+        )
+    with pytest.raises(ValueError):
+        transport.complete_with_tools(
+            credential("xai_oauth"),
+            "grok-4.5",
+            "hi",
+            tools=({"type": "function"},),
+        )
+    with pytest.raises(ValueError):
+        transport.complete_with_tool_output(
+            credential("xai_oauth"),
+            "grok-4.5",
+            previous_response_id="",
+            tool_outputs=(XaiToolOutput(call_id="c", output="{}"),),
+            tools=(_WEB_SEARCH_TOOL,),
+        )
+    with pytest.raises(ValueError):
+        transport.complete_with_tool_output(
+            credential("xai_oauth"),
+            "grok-4.5",
+            previous_response_id="resp-9",
+            tool_outputs=(),
+            tools=(_WEB_SEARCH_TOOL,),
+        )
+
+
+def test_provider_respond_with_tools_uses_oauth_only_policy():
+    tool_turn = XaiToolTurn(
+        response_id="resp-9",
+        model="grok-4.5",
+        text=None,
+        tool_calls=(
+            XaiFunctionCall(call_id="call-1", name="web_search", arguments="{}"),
+        ),
+        credential_source="xai_oauth",
+    )
+    transport = RecordingToolTransport(tool_turn)
+    oauth_source = StaticCredentialSource(credential("xai_oauth"))
+    provider = XaiProvider(
+        transport,
+        CredentialPolicy.OAUTH_ONLY,
+        oauth_source=oauth_source,
+    )
+
+    result = provider.respond_with_tools("hi", tools=(_WEB_SEARCH_TOOL,))
+
+    assert result is tool_turn
+    assert oauth_source.call_count == 1
+    credential_used, model, prompt, tools = transport.tool_calls[0]
+    assert credential_used.source_identity == "xai_oauth"
+    assert model == "grok-4.5"
+    assert prompt == "hi"
+    assert tools == (_WEB_SEARCH_TOOL,)
+
+
+def test_provider_respond_with_tool_outputs_uses_oauth_only_policy():
+    final_turn = XaiToolTurn(
+        response_id="resp-11",
+        model="grok-4.5",
+        text="done",
+        tool_calls=(),
+        credential_source="xai_oauth",
+    )
+    transport = RecordingToolTransport(final_turn)
+    provider = XaiProvider(
+        transport,
+        CredentialPolicy.OAUTH_ONLY,
+        oauth_source=StaticCredentialSource(credential("xai_oauth")),
+    )
+
+    result = provider.respond_with_tool_outputs(
+        previous_response_id="resp-9",
+        tool_outputs=(XaiToolOutput(call_id="call-1", output="{}"),),
+        tools=(_WEB_SEARCH_TOOL,),
+    )
+
+    assert result is final_turn
+    _, model, previous_id, outputs, tools = transport.output_calls[0]
+    assert model == "grok-4.5"
+    assert previous_id == "resp-9"
+    assert outputs == (XaiToolOutput(call_id="call-1", output="{}"),)
+    assert tools == (_WEB_SEARCH_TOOL,)
+
+
+def test_provider_tool_turns_propagate_credential_unavailable():
+    provider = XaiProvider(
+        RecordingToolTransport(),
+        CredentialPolicy.OAUTH_ONLY,
+        oauth_source=FailingCredentialSource(
+            CredentialUnavailable("no state")
+        ),
+    )
+
+    with pytest.raises(CredentialUnavailable):
+        provider.respond_with_tools("hi", tools=(_WEB_SEARCH_TOOL,))
+    with pytest.raises(CredentialUnavailable):
+        provider.respond_with_tool_outputs(
+            previous_response_id="resp-9",
+            tool_outputs=(XaiToolOutput(call_id="c", output="{}"),),
+            tools=(_WEB_SEARCH_TOOL,),
+        )

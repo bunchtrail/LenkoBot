@@ -403,8 +403,8 @@ Roadmap: [Phase 5](product-roadmap.md#phase-5-web-search-url-reader-и-knowledge
 
 ### Работы
 
-- [ ] Закрыть research gate бесплатного search provider.
-- [ ] Зафиксировать terms, rate limits и citation contract выбранного source.
+- [x] Закрыть research gate бесплатного search provider.
+- [x] Зафиксировать terms, rate limits и citation contract выбранного source.
 - [ ] Реализовать typed `SearchResult` и citation metadata.
 - [ ] Провести URL/web search через общий read-only policy/audit contract,
   пригодный для последующего `ToolBroker`.
@@ -422,7 +422,10 @@ Roadmap: [Phase 5](product-roadmap.md#phase-5-web-search-url-reader-и-knowledge
 - [ ] Зарегистрировать knowledge source/document/index purge hook в
   `ResetCoordinator`.
 - [ ] Маркировать web/knowledge content как untrusted data.
-- [ ] Оставить web search за feature gate, пока provider research не закрыт.
+- [x] Оставить web search за feature gate, пока provider research не закрыт.
+- [x] Реализовать xAI client-side `web_search` function call с bounded tool loop.
+- [x] Показывать редактируемый Telegram status с фактическим search query.
+- [x] Отправлять deduplicated escaped HTML links отдельным bounded сообщением.
 
 ### Exit gates
 
@@ -432,16 +435,16 @@ Roadmap: [Phase 5](product-roadmap.md#phase-5-web-search-url-reader-и-knowledge
 - [ ] URL/web search создаёт security audit outcome через общий policy boundary.
 - [ ] Удаление source удаляет chunks и rebuildable index.
 - [ ] Index полностью восстанавливается из canonical records.
-- [ ] Network failure не создаёт выдуманные citations.
-- [ ] Runtime не требует нового постоянного платного сервиса.
+- [x] Network failure не создаёт выдуманные citations.
+- [x] Runtime не требует нового постоянного платного сервиса.
 
 ### Evidence
 
 - Commit: `pending`
-- Search-provider research: `pending`
+- Search-provider research: [web-search-options-2026-07.md](../analysis/web-search-options-2026-07.md)
 - SSRF/security corpus: `pending`
 - Citation acceptance corpus: `pending`
-- Full suite: `pending`
+- Full suite: `304 passed`; Ruff, compileall, lock и diff checks успешны
 
 ## Phase 6. Web-панель владельца
 

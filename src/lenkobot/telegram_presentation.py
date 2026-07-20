@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from html import escape
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 
 _PERSONA_CALLBACK_PREFIX = "persona:v1:"
@@ -10,6 +12,9 @@ _MEMORIES_PAGE_CALLBACK_PREFIX = "mem:v1:"
 _FORGET_CALLBACK_PREFIX = "forget:v1:"
 _TELEGRAM_CALLBACK_DATA_LIMIT = 64
 TELEGRAM_MESSAGE_TEXT_LIMIT = 4096
+_SOURCE_COUNT_LIMIT = 5
+_SOURCE_TITLE_LIMIT = 96
+_SOURCE_URL_LIMIT = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +58,17 @@ class TelegramResponseKind(StrEnum):
     ERROR = "error"
 
 
+class TelegramParseMode(StrEnum):
+    HTML = "HTML"
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramResponse:
     chat_id: int
     kind: TelegramResponseKind
     text: str
     inline_keyboard: tuple[tuple["TelegramInlineButton", ...], ...] = ()
+    parse_mode: TelegramParseMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +81,12 @@ class TelegramInlineButton:
 class TelegramSentMessage:
     chat_id: int
     message_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramWebSource:
+    title: str
+    url: str
 
 
 class TelegramResponsePort(Protocol):
@@ -194,6 +210,44 @@ def split_telegram_text(
     if remaining or not chunks:
         chunks.append(remaining)
     return tuple(chunks)
+
+
+def render_sources_html(
+    sources: tuple[TelegramWebSource, ...],
+) -> str:
+    lines = ["<b>Источники:</b>"]
+    seen_urls = set()
+    for source in sources:
+        if len(lines) > _SOURCE_COUNT_LIMIT:
+            break
+        if not isinstance(source, TelegramWebSource):
+            continue
+        title = " ".join(source.title.split())
+        url = source.url.strip()
+        if not title or url in seen_urls or not _is_http_url(url):
+            continue
+        if len(url) > _SOURCE_URL_LIMIT:
+            continue
+        if len(title) > _SOURCE_TITLE_LIMIT:
+            title = title[: _SOURCE_TITLE_LIMIT - 1].rstrip() + "…"
+        line = (
+            f'{len(lines)}. <a href="{escape(url, quote=True)}">'
+            f"{escape(title, quote=True)}</a>"
+        )
+        candidate = "\n".join((*lines, line))
+        if len(candidate) > TELEGRAM_MESSAGE_TEXT_LIMIT:
+            break
+        lines.append(line)
+        seen_urls.add(url)
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _is_http_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
 def _split_boundary(text: str, limit: int) -> int:

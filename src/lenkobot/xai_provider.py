@@ -456,6 +456,29 @@ class XaiTextResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class XaiFunctionCall:
+    call_id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class XaiToolOutput:
+    call_id: str
+    output: str
+
+
+@dataclass(frozen=True, slots=True)
+class XaiToolTurn:
+    response_id: str | None
+    model: str
+    text: str | None
+    tool_calls: tuple[XaiFunctionCall, ...]
+    credential_source: str
+    fallback_from: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class XaiStructuredResponse:
     response_id: str | None
     model: str
@@ -569,6 +592,105 @@ class XaiResponsesTransport:
             credential_source=credential.source_identity,
         )
 
+    def complete_with_tools(
+        self,
+        credential: BearerCredential,
+        model: str,
+        prompt: XaiPrompt,
+        *,
+        tools: tuple[dict[str, object], ...],
+    ) -> XaiToolTurn:
+        validated_tools = _validate_tools(tools)
+        response, body = self._post_response(
+            credential,
+            model,
+            prompt,
+            tools=validated_tools,
+        )
+        return self._tool_turn(body, response, credential, model=model)
+
+    def complete_with_tool_output(
+        self,
+        credential: BearerCredential,
+        model: str,
+        *,
+        previous_response_id: str,
+        tool_outputs: tuple[XaiToolOutput, ...],
+        tools: tuple[dict[str, object], ...],
+    ) -> XaiToolTurn:
+        validated_tools = _validate_tools(tools)
+        if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+            raise ValueError("previous response ID cannot be empty")
+        if not tool_outputs:
+            raise ValueError("tool outputs cannot be empty")
+        for tool_output in tool_outputs:
+            if not isinstance(tool_output, XaiToolOutput):
+                raise ValueError("tool output is invalid")
+            if (
+                not isinstance(tool_output.call_id, str)
+                or not tool_output.call_id.strip()
+                or not isinstance(tool_output.output, str)
+            ):
+                raise ValueError("tool output is invalid")
+        response, body = self._post_response(
+            credential,
+            model,
+            "",
+            tools=validated_tools,
+            previous_response_id=previous_response_id.strip(),
+            tool_outputs=tool_outputs,
+        )
+        return self._tool_turn(body, response, credential, model=model)
+
+    def _tool_turn(
+        self,
+        body: Mapping[str, object],
+        response: HttpResponse,
+        credential: BearerCredential,
+        *,
+        model: str,
+    ) -> XaiToolTurn:
+        text = self._output_text_or_none(body)
+        calls = []
+        output = body.get("output", [])
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict) or item.get("type") != "function_call":
+                    continue
+                call_id = item.get("call_id")
+                name = item.get("name")
+                arguments = item.get("arguments")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    continue
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if not isinstance(arguments, str):
+                    continue
+                calls.append(
+                    XaiFunctionCall(
+                        call_id=call_id,
+                        name=name,
+                        arguments=arguments,
+                    )
+                )
+        if text is None and not calls:
+            raise ProviderRequestError(
+                "xAI response contained no assistant output",
+                status=response.status,
+                code="invalid_response",
+                raw_body=response.body,
+                headers=response.headers,
+            )
+        response_id = body.get("id")
+        response_model = body.get("model")
+        return XaiToolTurn(
+            response_id=response_id if isinstance(response_id, str) else None,
+            model=response_model if isinstance(response_model, str) else model,
+            text=text,
+            tool_calls=tuple(calls),
+            credential_source=credential.source_identity,
+        )
+
     def _post_response(
         self,
         credential: BearerCredential,
@@ -576,14 +698,33 @@ class XaiResponsesTransport:
         prompt: XaiPrompt,
         *,
         response_format: dict[str, object] | None = None,
+        tools: tuple[dict[str, object], ...] | None = None,
+        previous_response_id: str | None = None,
+        tool_outputs: tuple[XaiToolOutput, ...] | None = None,
     ) -> tuple[HttpResponse, dict[str, object]]:
         endpoint = self._responses_endpoint(credential.base_url)
+        if tool_outputs is not None:
+            request_input: object = [
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_output.call_id,
+                    "output": tool_output.output,
+                }
+                for tool_output in tool_outputs
+            ]
+        else:
+            request_input = _serialize_input(prompt)
         payload: dict[str, object] = {
             "model": model,
-            "input": _serialize_input(prompt),
+            "input": request_input,
         }
         if response_format is not None:
             payload["text"] = {"format": response_format}
+        if tools is not None:
+            payload["tools"] = [dict(tool) for tool in tools]
+            payload["parallel_tool_calls"] = False
+        if previous_response_id is not None:
+            payload["previous_response_id"] = previous_response_id
         response = self._http_client.post_json(
             endpoint,
             {
@@ -602,7 +743,7 @@ class XaiResponsesTransport:
         return response, body
 
     @staticmethod
-    def _output_text(body: Mapping[str, object], response: HttpResponse) -> str:
+    def _output_text_or_none(body: Mapping[str, object]) -> str | None:
         text_parts = []
         output = body.get("output", [])
         if isinstance(output, list):
@@ -621,6 +762,13 @@ class XaiResponsesTransport:
                     if isinstance(text, str):
                         text_parts.append(text)
         if not text_parts:
+            return None
+        return "".join(text_parts)
+
+    @classmethod
+    def _output_text(cls, body: Mapping[str, object], response: HttpResponse) -> str:
+        text = cls._output_text_or_none(body)
+        if text is None:
             raise ProviderRequestError(
                 "xAI response contained no assistant output text",
                 status=response.status,
@@ -628,7 +776,7 @@ class XaiResponsesTransport:
                 raw_body=response.body,
                 headers=response.headers,
             )
-        return "".join(text_parts)
+        return text
 
     def _responses_endpoint(self, base_url: str) -> str:
         try:
@@ -695,6 +843,7 @@ class XaiResponsesTransport:
 
 class XaiProvider:
     supports_message_input = True
+    supports_tools = True
 
     def __init__(
         self,
@@ -746,6 +895,65 @@ class XaiProvider:
         credential = source.get_credential()
         return self._transport.complete(credential, self._model, prompt)
 
+    def respond_with_tools(
+        self,
+        prompt: XaiPrompt,
+        *,
+        tools: tuple[dict[str, object], ...],
+    ) -> XaiToolTurn:
+        return self._tool_turn(
+            lambda credential: self._transport.complete_with_tools(
+                credential,
+                self._model,
+                prompt,
+                tools=tools,
+            )
+        )
+
+    def respond_with_tool_outputs(
+        self,
+        *,
+        previous_response_id: str,
+        tool_outputs: tuple[XaiToolOutput, ...],
+        tools: tuple[dict[str, object], ...],
+    ) -> XaiToolTurn:
+        return self._tool_turn(
+            lambda credential: self._transport.complete_with_tool_output(
+                credential,
+                self._model,
+                previous_response_id=previous_response_id,
+                tool_outputs=tool_outputs,
+                tools=tools,
+            )
+        )
+
+    def _tool_turn(
+        self,
+        invoke: Callable[[BearerCredential], XaiToolTurn],
+    ) -> XaiToolTurn:
+        if self._policy is CredentialPolicy.API_KEY_ONLY:
+            return self._complete_tool_turn(self._api_key_source, invoke)
+        if self._policy is CredentialPolicy.OAUTH_ONLY:
+            return self._complete_tool_turn(self._oauth_source, invoke)
+
+        fallback_from = "xai_oauth"
+        try:
+            oauth_credential = self._oauth_source.get_credential()
+            fallback_from = oauth_credential.source_identity
+            return invoke(oauth_credential)
+        except EntitlementDenied:
+            result = self._complete_tool_turn(self._api_key_source, invoke)
+            return replace(result, fallback_from=fallback_from)
+
+    @staticmethod
+    def _complete_tool_turn(
+        source: CredentialSource | None,
+        invoke: Callable[[BearerCredential], XaiToolTurn],
+    ) -> XaiToolTurn:
+        if source is None:
+            raise CredentialUnavailable("credential source is not configured")
+        return invoke(source.get_credential())
+
 
 class XaiStructuredProvider:
     def __init__(
@@ -774,6 +982,29 @@ class XaiStructuredProvider:
             schema_name=schema_name,
             schema=schema,
         )
+
+
+def _validate_tools(
+    tools: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    if isinstance(tools, list):
+        tools = tuple(tools)
+    if not isinstance(tools, tuple) or not tools:
+        raise ValueError("xAI tools must be a non-empty tuple")
+    validated = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            raise ValueError("xAI tool definition is invalid")
+        if tool.get("type") != "function":
+            raise ValueError("xAI tool type must be function")
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("xAI tool name cannot be empty")
+        parameters = tool.get("parameters")
+        if not isinstance(parameters, Mapping):
+            raise ValueError("xAI tool parameters must be an object")
+        validated.append(dict(tool))
+    return tuple(validated)
 
 
 def _serialize_input(prompt: XaiPrompt) -> str | list[dict[str, str]]:

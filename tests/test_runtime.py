@@ -10,12 +10,15 @@ from lenkobot.runtime import (
     load_runtime_settings,
     login_telegram_e2e,
     main,
+    open_local_application,
     run_application,
     run_local_chat,
+    WebSearchSettings,
 )
 from lenkobot.telegram_e2e import TelegramE2EReport, TelegramE2EStep
 from lenkobot.telegram_e2e_credentials import TelegramE2ECredentialState
 from lenkobot.xai_provider import CredentialUnavailable, OAuthTokenState
+from lenkobot.web_search import DdgsWebSearch, WebSearchToolLoop
 
 
 def write_config(tmp_path):
@@ -59,6 +62,92 @@ def test_load_runtime_settings_uses_config_parent_data_root_and_persona_catalog(
     assert settings.allowed_user_id == 123456789
     assert settings.oauth_client_id == "public-client-id"
     assert settings.persona_catalog.default_persona_key == "lenko"
+    assert settings.web_search is None
+
+
+def test_load_runtime_settings_parses_keyless_ddgs_web_search(tmp_path):
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write(
+            '\n[web_search]\nprovider = "ddgs"\nmax_results = 4\n'
+        )
+
+    settings = load_runtime_settings(config_path)
+
+    assert settings.web_search == WebSearchSettings(
+        provider="ddgs",
+        max_results=4,
+    )
+
+
+@pytest.mark.parametrize(
+    "web_search_config",
+    (
+        'provider = "firecrawl"',
+        'provider = "ddgs"\nmax_results = 0',
+        'provider = "ddgs"\nmax_results = 11',
+        'provider = "ddgs"\napi_key = "must-not-live-in-toml"',
+    ),
+)
+def test_load_runtime_settings_rejects_invalid_web_search_config(
+    tmp_path,
+    web_search_config,
+):
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write(f"\n[web_search]\n{web_search_config}\n")
+
+    with pytest.raises(ValueError, match="web search"):
+        load_runtime_settings(config_path)
+
+
+def test_open_local_application_wires_ddgs_tool_loop(tmp_path, monkeypatch):
+    import lenkobot.runtime as runtime
+
+    class ExistingCredentialStore:
+        target_name = "LenkoBot/xai-oauth/v1/default"
+
+        def load(self):
+            return token_state()
+
+    class FakeMutex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write('\n[web_search]\nprovider = "ddgs"\nmax_results = 4\n')
+    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
+    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+
+    application = open_local_application(load_runtime_settings(config_path))
+    try:
+        assert isinstance(application.service._tool_loop, WebSearchToolLoop)
+        assert isinstance(application.service._tool_loop._search, DdgsWebSearch)
+    finally:
+        application.close()
+
+
+def test_open_local_application_requires_tavily_key_from_environment(
+    tmp_path,
+    monkeypatch,
+):
+    import lenkobot.runtime as runtime
+
+    class ExistingCredentialStore:
+        target_name = "LenkoBot/xai-oauth/v1/default"
+
+        def load(self):
+            return token_state()
+
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write('\n[web_search]\nprovider = "tavily"\n')
+    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    with pytest.raises(CredentialUnavailable, match="Tavily API key"):
+        open_local_application(load_runtime_settings(config_path))
 
 
 def test_load_runtime_settings_uses_hermes_reference_client_when_oauth_override_is_missing(

@@ -82,5 +82,9 @@ bot_username = "lenkobot_test_bot"
 [oauth]
 client_id = "b1a00492-073a-47ea-816f-4c329264a828"
 
+[web_search]
+provider = "ddgs"
+max_results = 5
+
 [export]
 age_recipient = "age1example"

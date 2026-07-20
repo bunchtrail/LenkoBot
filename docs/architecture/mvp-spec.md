@@ -143,6 +143,7 @@ Telegram long polling
   -> conversation/persona router
   -> persona context builder
   -> Grok provider facade
+  -> bounded web search tool loop (optional, config-gated)
   -> internal typed event stream
   -> Telegram status/final renderer
 
@@ -207,6 +208,7 @@ IncomingTelegramMessage
 - Windows adapter использует Credential Manager generic blob с лимитом 2560 bytes и named `Local\\` mutex. `WAIT_ABANDONED` продолжает lifecycle после повторного чтения state; timeout/failure блокирует refresh.
 - Device login разделён на `start` (URL/code для presentation) и `complete` (poll и одно сохранение state под refresh lock). Device и token endpoints принимают только approved HTTPS hosts на default port; verification URI из внешнего ответа проходит такую же проверку. Автоматическое открытие браузера и persistence при terminal error не входят в contract.
 - Первый local composition root создаёт `CredentialPolicy.OAUTH_ONLY` и не читает `XAI_API_KEY`. `oauth_then_api_key` остаётся будущей opt-in policy после отдельного решения о classifier.
+- `Confirmed`: transport умеет client-side function calling: request добавляет `tools` (function definition с JSON Schema `parameters`) и `parallel_tool_calls: false`; response `output[]` парсит items `type="function_call"` (`call_id`, `name`, raw `arguments` JSON string) наряду с assistant text. Continuation отправляет `previous_response_id` и `input=[{"type":"function_call_output","call_id","output"}]`. Tool turn проходит тот же credential policy и host allowlist, что text turn; response без text и без function_call является `invalid_response`. Raw `arguments` не показываются пользователю и не попадают в transcript.
 
 ## Composition root и локальный запуск
 
@@ -223,6 +225,7 @@ IncomingTelegramMessage
 - Cross-client equality Bot API reply target и Telethon sent-message ID является `Assumed` до первого live E2E: public API подтверждает оба поля, но не формулирует их численное равенство между clients. Mismatch завершается fail-closed и не ослабляется временной эвристикой.
 - Полный E2E является manual local gate и не запускается в CI. Test account/dialog не используются параллельно вручную; CLI не принимает target, chat, command, session или credential overrides.
 - `config.example.toml` определяет один TOML contract: root `default_persona_key` и `[[personas]]`, `[telegram].allowed_user_id` и optional `[oauth].client_id` override. В конфиге нет Telegram token, API key, device code, access token или refresh token.
+- Optional `[web_search]` включает tool loop: `provider = "ddgs"` (default, keyless) или `"tavily"`, `max_results` bounded 1..10 (default 5). Отсутствие таблицы означает disabled: turn идёт plain provider path без tools. Tavily key читается только из `TAVILY_API_KEY`; secret в TOML отклоняется. `ddgs` не требует секретов.
 - Default data root равен `<config parent>/data`; `--data-root` является явным override. Root передаёт один `<data root>/state.db` обоим SQLite stores и закрывает оба connection при normal или exceptional polling exit.
 - Current root использует fixed profile `default`, account-specific proof-tested OAuth inference URL `https://api.x.ai/v1` и model `grok-4.5`. Совместимость OAuth bearer с этим direct host остаётся `Open`; account switching, custom inference hosts и Docker/VPS secret backend остаются отдельными решениями.
 
@@ -242,6 +245,8 @@ IncomingTelegramMessage
 - `/memories [page]` показывает header `Память, страница N из M`, inline prev/next кнопки по SQL count и позволяет page callback редактировать list message на месте; pagination является idempotent read-only операцией и не требует receipt. `/forget` без id показывает первую страницу записей с per-record delete buttons, которые открывают тот же confirmation flow.
 - `/remember <text>` создаёт owner-scoped shared memory с kind `fact`; пустой текст и текст длиннее 500 символов отклоняются. `/memories [page]` показывает active memory records текущего пользователя всех scopes по 5 записей на страницу в порядке `updated_at DESC, id DESC` с inline pagination. `/forget [id]` выполняет owner-scoped physical delete только после one-time confirmation. Все эти команды проходят private-only authorization и не вызывают provider.
 - Aiogram adapter может создать response port, связанный с исходным `Message`, либо fixed-owner outbound port для `live-smoke`; Bot API SDK types остаются только в adapter boundary. Typing action и `message is not modified` handling являются adapter-only деталями. Telethon SDK types принадлежат отдельному optional E2E adapter и не входят в production runtime.
+- `Confirmed`: web search подключается как bounded tool loop вокруг provider (`web_search` function tool, максимум 2 поиска за turn). Решение о поиске принимает модель; service не запускает поиск по эвристике. При `function_call` status message редактируется в `ищу: <query>` (query truncated, fixed text, typing продолжается), search выполняется вне event loop, результаты (title/url/snippet, snippet truncated) возвращаются модели как `function_call_output`, а финальный ответ заменяет status обычным edit path. Search backend failure возвращается модели как typed error output, чтобы она ответила из своих знаний; turn не падает из-за search outage. Неизвестный tool name получает error output и не выполняет side effects.
+- Источники доставляются отдельным bounded сообщением после final: `Источники:` с нумерованными HTML-ссылками (`parse_mode=HTML` только для этого сообщения; title/url escaped, title truncated, не более 5 уникальных URL). Ответ ассистента остаётся plain text, поэтому bounded splitter не может разрезать HTML tag. Failure отправки sources не отменяет уже доставленный ответ и не является turn error.
 
 ## Memory store и context builder
 

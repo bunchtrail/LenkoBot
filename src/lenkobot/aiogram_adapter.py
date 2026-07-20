@@ -73,6 +73,8 @@ async def _edit_via_bot(
     kwargs = {"text": response.text}
     if markup is not None:
         kwargs["reply_markup"] = markup
+    if response.parse_mode is not None:
+        kwargs["parse_mode"] = response.parse_mode.value
     try:
         await edit_call(**kwargs)
     except TelegramBadRequest as error:
@@ -97,10 +99,12 @@ class AiogramTelegramResponsePort:
         if self._message.chat is None or response.chat_id != self._message.chat.id:
             raise ValueError("Telegram response target does not match source chat")
         markup = _reply_markup(response)
-        if markup is None:
-            sent = await self._message.answer(response.text)
-        else:
-            sent = await self._message.answer(response.text, reply_markup=markup)
+        kwargs = {}
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+        if response.parse_mode is not None:
+            kwargs["parse_mode"] = response.parse_mode.value
+        sent = await self._message.answer(response.text, **kwargs)
         if response.kind is TelegramResponseKind.STATUS:
             self._start_typing()
         elif response.kind in (TelegramResponseKind.FINAL, TelegramResponseKind.ERROR):
@@ -181,6 +185,8 @@ class AiogramTelegramReplyResponsePort:
         }
         if markup is not None:
             kwargs["reply_markup"] = markup
+        if response.parse_mode is not None:
+            kwargs["parse_mode"] = response.parse_mode.value
         sent = await self._message.answer(response.text, **kwargs)
         return TelegramSentMessage(
             chat_id=self._message.chat.id,
@@ -233,6 +239,8 @@ class AiogramBotResponsePort:
             markup = _reply_markup(response)
             if markup is not None:
                 kwargs["reply_markup"] = markup
+            if response.parse_mode is not None:
+                kwargs["parse_mode"] = response.parse_mode.value
             sent = await self._bot.send_message(**kwargs)
         except Exception as error:
             raise TelegramDeliveryError("Telegram Bot API delivery failed") from error

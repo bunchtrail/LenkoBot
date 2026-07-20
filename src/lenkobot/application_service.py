@@ -14,10 +14,12 @@ from .telegram_presentation import (
     TelegramCommand,
     TelegramEditableResponsePort,
     TelegramInlineButton,
+    TelegramParseMode,
     TelegramResponse,
     TelegramResponseKind,
     TelegramResponsePort,
     TelegramSentMessage,
+    TelegramWebSource,
     confirmation_callback_data,
     forget_callback_data,
     memories_page_callback_data,
@@ -28,6 +30,7 @@ from .telegram_presentation import (
     parse_telegram_command,
     persona_callback_data,
     render_command_index,
+    render_sources_html,
     split_telegram_text,
 )
 from .telegram_router import (
@@ -36,6 +39,7 @@ from .telegram_router import (
     RoutedTurn,
     TelegramRouter,
 )
+from .web_search import SearchResult, WebSearchToolLoop
 from .xai_provider import XaiPrompt, XaiTextResponse
 
 
@@ -197,6 +201,7 @@ class TelegramApplicationService:
         session_finalizer: SessionFinalizer | None = None,
         persona_config_path: Path | None = None,
         confirmation_store: ConfirmationStore | None = None,
+        tool_loop: WebSearchToolLoop | None = None,
     ) -> None:
         self._router = router
         self._persona_catalog = persona_catalog
@@ -219,6 +224,7 @@ class TelegramApplicationService:
         self._session_finalizer = session_finalizer
         self._persona_config_path = persona_config_path
         self._confirmation_store = confirmation_store
+        self._tool_loop = tool_loop
         self._voice_renderer = VoiceRenderer()
 
     async def handle(
@@ -292,6 +298,7 @@ class TelegramApplicationService:
             )
             raise
 
+        sources = ()
         try:
             prompt: XaiPrompt = self._build_prompt(persona, turn)
             if self._context_builder is not None:
@@ -313,10 +320,26 @@ class TelegramApplicationService:
                     prompt = self._context_builder.build_messages(**context_kwargs)
                 else:
                     prompt = self._context_builder.build(**context_kwargs)
-            result = await asyncio.to_thread(
-                self._provider.respond,
-                prompt,
-            )
+            if self._tool_loop is None:
+                result = await asyncio.to_thread(
+                    self._provider.respond,
+                    prompt,
+                )
+            else:
+                async def on_search_start(query: str) -> None:
+                    await self._update_search_status(
+                        presenter,
+                        chat_id=turn.chat_id,
+                        status_handle=status_handle,
+                        query=query,
+                    )
+
+                loop_result = await self._tool_loop.respond(
+                    prompt,
+                    on_search_start=on_search_start,
+                )
+                result = loop_result.response
+                sources = loop_result.sources
         except Exception:
             self._record_transcript_failure(
                 user_turn,
@@ -419,6 +442,11 @@ class TelegramApplicationService:
                     text=result.text,
                 ),
                 edit_handle=status_handle,
+            )
+            await self._send_sources(
+                presenter,
+                chat_id=turn.chat_id,
+                sources=sources,
             )
         except Exception:
             self._record_transcript_failure(
@@ -820,6 +848,61 @@ class TelegramApplicationService:
             await presenter.send(
                 replace(response, text=chunk, inline_keyboard=())
             )
+
+    async def _update_search_status(
+        self,
+        presenter: TelegramResponsePort,
+        *,
+        chat_id: int,
+        status_handle: TelegramSentMessage | None,
+        query: str,
+    ) -> None:
+        if (
+            status_handle is None
+            or status_handle.chat_id != chat_id
+            or not isinstance(presenter, TelegramEditableResponsePort)
+        ):
+            return
+        try:
+            await presenter.edit(
+                status_handle,
+                TelegramResponse(
+                    chat_id=chat_id,
+                    kind=TelegramResponseKind.STATUS,
+                    text=f"ищу: «{_snippet(query, limit=80)}»",
+                ),
+            )
+        except Exception:
+            pass
+
+    async def _send_sources(
+        self,
+        presenter: TelegramResponsePort,
+        *,
+        chat_id: int,
+        sources: tuple[SearchResult, ...],
+    ) -> None:
+        if not sources:
+            return
+        text = render_sources_html(
+            tuple(
+                TelegramWebSource(title=source.title, url=source.url)
+                for source in sources
+            )
+        )
+        if not text:
+            return
+        try:
+            await presenter.send(
+                TelegramResponse(
+                    chat_id=chat_id,
+                    kind=TelegramResponseKind.NOTICE,
+                    text=text,
+                    parse_mode=TelegramParseMode.HTML,
+                )
+            )
+        except Exception:
+            pass
 
     async def _edit_bound(
         self,

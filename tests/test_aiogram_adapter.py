@@ -19,6 +19,7 @@ from lenkobot.telegram_presentation import (
     TELEGRAM_COMMANDS,
     TelegramResponse,
     TelegramResponseKind,
+    TelegramParseMode,
     TelegramInlineButton,
     TelegramSentMessage,
 )
@@ -542,12 +543,22 @@ class RecordingBotAPI:
     def __init__(self):
         self.edits = []
         self.chat_actions = []
+        self.edit_parse_modes = []
         self.edit_error = None
 
-    async def edit_message_text(self, *, text, chat_id, message_id, reply_markup=None):
+    async def edit_message_text(
+        self,
+        *,
+        text,
+        chat_id,
+        message_id,
+        reply_markup=None,
+        parse_mode=None,
+    ):
         if self.edit_error is not None:
             raise self.edit_error
         self.edits.append((text, chat_id, message_id, reply_markup))
+        self.edit_parse_modes.append(parse_mode)
         return True
 
     async def send_chat_action(self, *, chat_id, action):
@@ -559,10 +570,12 @@ def editable_telegram_message(*, bot=None, message_id=10):
     message.message_id = message_id
     message.bot = bot if bot is not None else RecordingBotAPI()
     message.sent = []
+    message.parse_modes = []
 
-    async def answer(text, *, reply_markup=None):
+    async def answer(text, *, reply_markup=None, parse_mode=None):
         sent = SimpleNamespace(message_id=100 + len(message.sent))
         message.sent.append((text, reply_markup, sent.message_id))
+        message.parse_modes.append(parse_mode)
         return sent
 
     message.answer = answer
@@ -610,6 +623,27 @@ def test_port_edit_maps_text_and_markup_to_bot_api():
     text, chat_id, message_id, markup = bot.edits[0]
     assert (text, chat_id, message_id) == ("updated", 500, 100)
     assert markup.inline_keyboard[0][0].callback_data == "mem:v1:2"
+
+
+def test_port_passes_explicit_html_parse_mode_on_send_and_edit():
+    bot = RecordingBotAPI()
+    message = editable_telegram_message(bot=bot)
+    port = AiogramTelegramResponsePort(message)
+    response = TelegramResponse(
+        chat_id=500,
+        kind=TelegramResponseKind.FINAL,
+        text='<b>Источники:</b>\n1. <a href="https://example.com">Example</a>',
+        parse_mode=TelegramParseMode.HTML,
+    )
+
+    asyncio.run(port.send(response))
+    edited = asyncio.run(
+        port.edit(TelegramSentMessage(chat_id=500, message_id=100), response)
+    )
+
+    assert message.parse_modes == ["HTML"]
+    assert edited is True
+    assert bot.edit_parse_modes == ["HTML"]
 
 
 def test_port_edit_treats_not_modified_as_successful_noop():

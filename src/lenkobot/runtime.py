@@ -45,6 +45,7 @@ from .telegram_router import (
     SQLiteConversationStore,
     TelegramRouter,
 )
+from .web_search import DdgsWebSearch, TavilyWebSearch, WebSearchToolLoop
 from .xai_provider import (
     CredentialPolicy,
     CredentialUnavailable,
@@ -64,11 +65,18 @@ _HERMES_REFERENCE_XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 
 @dataclass(frozen=True, slots=True)
+class WebSearchSettings:
+    provider: str
+    max_results: int = 5
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     data_root: Path
     allowed_user_id: int
     oauth_client_id: str
     persona_catalog: PersonaCatalog
+    web_search: WebSearchSettings | None = None
     export_recipient: str | None = None
     config_path: Path | None = None
 
@@ -90,12 +98,15 @@ def load_runtime_settings(
     telegram = data.get("telegram")
     oauth = data.get("oauth")
     export = data.get("export")
+    web_search = data.get("web_search")
     if not isinstance(telegram, dict):
         raise ValueError("runtime configuration must contain a telegram table")
     if oauth is not None and not isinstance(oauth, dict):
         raise ValueError("runtime configuration oauth value must be a table")
     if export is not None and not isinstance(export, dict):
         raise ValueError("runtime configuration export value must be a table")
+    if web_search is not None and not isinstance(web_search, dict):
+        raise ValueError("runtime configuration web search value must be a table")
 
     allowed_user_id = telegram.get("allowed_user_id")
     if (
@@ -122,6 +133,27 @@ def load_runtime_settings(
     ):
         raise ValueError("export age_recipient is invalid")
 
+    web_search_settings = None
+    if isinstance(web_search, dict):
+        unknown_fields = set(web_search) - {"provider", "max_results"}
+        if unknown_fields:
+            raise ValueError("web search configuration contains unknown fields")
+        search_provider = web_search.get("provider", "ddgs")
+        if search_provider not in {"ddgs", "tavily"}:
+            raise ValueError("web search provider must be ddgs or tavily")
+        max_results = web_search.get("max_results", 5)
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > 10
+        ):
+            raise ValueError("web search max_results must be between 1 and 10")
+        web_search_settings = WebSearchSettings(
+            provider=search_provider,
+            max_results=max_results,
+        )
+
     try:
         persona_catalog = PersonaCatalog.from_toml(path)
     except (KeyError, TypeError, ValueError) as error:
@@ -133,6 +165,7 @@ def load_runtime_settings(
         allowed_user_id=allowed_user_id,
         oauth_client_id=client_id,
         persona_catalog=persona_catalog,
+        web_search=web_search_settings,
         export_recipient=export_recipient,
         config_path=path,
     )
@@ -230,6 +263,19 @@ def open_local_application(settings: RuntimeSettings) -> LocalApplication:
         oauth_source=oauth_source,
         model=_MODEL,
     )
+    tool_loop = None
+    if settings.web_search is not None:
+        if settings.web_search.provider == "ddgs":
+            search = DdgsWebSearch(max_results=settings.web_search.max_results)
+        else:
+            tavily_key = os.environ.get("TAVILY_API_KEY", "")
+            if not tavily_key.strip():
+                raise CredentialUnavailable("Tavily API key is unavailable")
+            search = TavilyWebSearch(
+                tavily_key,
+                max_results=settings.web_search.max_results,
+            )
+        tool_loop = WebSearchToolLoop(provider, search)
     structured_provider = XaiStructuredProvider(
         transport,
         oauth_source=oauth_source,
@@ -295,6 +341,7 @@ def open_local_application(settings: RuntimeSettings) -> LocalApplication:
         session_finalizer=session_finalizer,
         persona_config_path=settings.config_path,
         confirmation_store=confirmation_store,
+        tool_loop=tool_loop,
     )
     return LocalApplication(
         service,

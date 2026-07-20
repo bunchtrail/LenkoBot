@@ -15,6 +15,7 @@ from lenkobot.session_store import (
 )
 from lenkobot.telegram_presentation import (
     TelegramInlineButton,
+    TelegramParseMode,
     TelegramResponseKind,
     TelegramSentMessage,
     confirmation_callback_data,
@@ -29,6 +30,7 @@ from lenkobot.telegram_router import (
     SQLiteConversationStore,
     TelegramRouter,
 )
+from lenkobot.web_search import SearchResult, ToolLoopResult
 from lenkobot.xai_provider import ProviderRequestError, XaiTextResponse
 
 
@@ -60,6 +62,13 @@ class EditableRecordingPort(RecordingResponsePort):
 
     def bound_handle(self):
         return self.bound
+
+
+class SourcesFailingPort(EditableRecordingPort):
+    async def send(self, response):
+        if response.parse_mode is TelegramParseMode.HTML:
+            raise RuntimeError("source delivery failed")
+        return await super().send(response)
 
 
 class MutableClock:
@@ -101,6 +110,19 @@ class RecordingProvider:
         self.prompts.append(prompt)
         if self.error is not None:
             raise self.error
+        return self.result
+
+
+class RecordingToolLoop:
+    def __init__(self, result, *, query="курс доллара сегодня"):
+        self.result = result
+        self.query = query
+        self.prompts = []
+
+    async def respond(self, prompt, *, on_search_start=None):
+        self.prompts.append(prompt)
+        if on_search_start is not None:
+            await on_search_start(self.query)
         return self.result
 
 
@@ -165,6 +187,7 @@ def build_service(
     session_finalizer=None,
     confirmation_store="auto",
     confirmation_clock=None,
+    tool_loop=None,
 ):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
@@ -189,6 +212,7 @@ def build_service(
         extraction_service=extraction_service,
         session_finalizer=session_finalizer,
         confirmation_store=confirmation_store,
+        tool_loop=tool_loop,
     ), router
 
 
@@ -223,6 +247,81 @@ def test_text_turn_uses_active_persona_and_presents_status_then_final(tmp_path):
         (TelegramResponseKind.STATUS, "Готовлю ответ"),
         (TelegramResponseKind.FINAL, "Hello from the companion"),
     ]
+
+
+def test_web_search_edits_status_and_sends_linked_sources(tmp_path):
+    provider = RecordingProvider(error=AssertionError("plain provider called"))
+    source = SearchResult(
+        title="ЦБ РФ & курсы",
+        url="https://cbr.ru/currency_base/daily/?a=1&b=2",
+        snippet="USD 80",
+    )
+    tool_loop = RecordingToolLoop(
+        ToolLoopResult(
+            response=XaiTextResponse(
+                response_id="resp-search",
+                model="grok-4.5",
+                text="сейчас доллар стоит 80 рублей",
+                credential_source="xai_oauth",
+            ),
+            sources=(source,),
+        )
+    )
+    response_port = EditableRecordingPort()
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        tool_loop=tool_loop,
+    )
+
+    result = asyncio.run(service.handle(telegram_message("почём доллар?")))
+
+    assert result.text == "сейчас доллар стоит 80 рублей"
+    assert provider.prompts == []
+    assert tool_loop.prompts == [
+        "A calm companion.\n\nUser message:\nпочём доллар?"
+    ]
+    assert response_port.responses[0].kind is TelegramResponseKind.STATUS
+    assert response_port.edits[0][1].kind is TelegramResponseKind.STATUS
+    assert response_port.edits[0][1].text == "ищу: «курс доллара сегодня»"
+    assert response_port.edits[1][1].kind is TelegramResponseKind.FINAL
+    assert response_port.edits[1][1].text == "сейчас доллар стоит 80 рублей"
+    sources_response = response_port.responses[1]
+    assert sources_response.kind is TelegramResponseKind.NOTICE
+    assert sources_response.parse_mode is TelegramParseMode.HTML
+    assert sources_response.text == (
+        '<b>Источники:</b>\n'
+        '1. <a href="https://cbr.ru/currency_base/daily/?a=1&amp;b=2">'
+        "ЦБ РФ &amp; курсы</a>"
+    )
+
+
+def test_source_delivery_failure_does_not_lose_final_answer(tmp_path):
+    response = XaiTextResponse(
+        response_id="resp-search",
+        model="grok-4.5",
+        text="answer survives",
+        credential_source="xai_oauth",
+    )
+    tool_loop = RecordingToolLoop(
+        ToolLoopResult(
+            response=response,
+            sources=(SearchResult("Source", "https://example.com", "data"),),
+        )
+    )
+    response_port = SourcesFailingPort()
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(error=AssertionError("plain provider called")),
+        response_port,
+        tool_loop=tool_loop,
+    )
+
+    result = asyncio.run(service.handle(telegram_message("search this")))
+
+    assert result is response
+    assert response_port.edits[-1][1].text == "answer survives"
 
 
 def test_provider_fallback_is_presented_as_an_expense_notice(tmp_path):
