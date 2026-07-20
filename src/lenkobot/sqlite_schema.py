@@ -1,6 +1,10 @@
 from collections.abc import Callable
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sqlite3
+
+from .personas import Persona, VoicePack, persona_content_hash
 
 
 class SchemaVersionError(RuntimeError):
@@ -330,12 +334,133 @@ def _create_phase_two_lifecycle_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_persona_version_schema(connection: sqlite3.Connection) -> None:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "persona" not in tables:
+        _create_memory_schema(connection)
+    if "persona_session" not in tables:
+        _create_conversation_schema(connection)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS persona_version (
+            id INTEGER PRIMARY KEY,
+            persona_id INTEGER NOT NULL REFERENCES persona(id) ON DELETE CASCADE,
+            identity_version INTEGER NOT NULL CHECK(identity_version > 0),
+            display_name TEXT NOT NULL,
+            identity_prompt TEXT NOT NULL,
+            voice_json TEXT NOT NULL CHECK(json_valid(voice_json)),
+            content_hash TEXT NOT NULL CHECK(length(trim(content_hash)) > 0),
+            created_at TEXT NOT NULL,
+            UNIQUE(persona_id, identity_version),
+            UNIQUE(persona_id, content_hash)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS persona_version_persona_created_idx
+            ON persona_version(persona_id, created_at DESC, id DESC)
+        """
+    )
+
+    legacy_created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    empty_voice = VoicePack()
+    for row in connection.execute(
+        """
+        SELECT id, key, display_name, identity_prompt, identity_version
+        FROM persona
+        """
+    ).fetchall():
+        persona = Persona(
+            key=str(row["key"]),
+            display_name=str(row["display_name"]),
+            identity_prompt=str(row["identity_prompt"]),
+            identity_version=int(row["identity_version"]),
+            voice=empty_voice,
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO persona_version (
+                persona_id, identity_version, display_name, identity_prompt,
+                voice_json, content_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(row["id"]),
+                persona.identity_version,
+                persona.display_name,
+                persona.identity_prompt,
+                json.dumps(
+                    empty_voice.as_dict(),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                persona_content_hash(persona),
+                legacy_created_at,
+            ),
+        )
+
+    columns = _column_names(connection, "persona_session")
+    if "persona_version_id" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE persona_session
+            ADD COLUMN persona_version_id INTEGER REFERENCES persona_version(id)
+            """
+        )
+    connection.execute(
+        """
+        UPDATE persona_session
+        SET persona_version_id = (
+            SELECT version.id
+            FROM persona_version AS version
+            JOIN persona ON persona.id = version.persona_id
+            WHERE persona.profile_id = 'default'
+                AND persona.key = persona_session.persona_key
+                AND version.identity_version = persona_session.identity_version
+        )
+        WHERE persona_version_id IS NULL
+        """
+    )
+
+
+def _create_action_confirmation_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_confirmation (
+            token TEXT PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL CHECK(length(trim(action_type)) > 0),
+            payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+            payload_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS action_confirmation_owner_expiry_idx
+            ON action_confirmation(owner_user_id, expires_at)
+        """
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_conversation_schema,
     _create_memory_schema,
     _add_conversation_version,
     _create_session_schema,
     _create_phase_two_lifecycle_schema,
+    _create_persona_version_schema,
+    _create_action_confirmation_schema,
 )
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 

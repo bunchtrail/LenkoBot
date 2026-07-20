@@ -9,6 +9,7 @@ import sqlite3
 from typing import Protocol
 
 from .personas import Persona
+from .persona_store import ensure_persona_version, persona_version_from_row
 from .sqlite_schema import open_state_database
 
 
@@ -186,32 +187,33 @@ class SQLiteMemoryStore:
 
     def register_persona(self, persona: Persona) -> int:
         with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO persona (
-                    profile_id, key, display_name, identity_prompt,
-                    identity_version, status
-                )
-                VALUES (?, ?, ?, ?, ?, 'active')
-                ON CONFLICT(profile_id, key) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    identity_prompt = excluded.identity_prompt,
-                    identity_version = excluded.identity_version,
-                    status = 'active'
-                """,
-                (
-                    self._profile_id,
-                    persona.key,
-                    persona.display_name,
-                    persona.identity_prompt,
-                    persona.identity_version,
-                ),
+            persona_id, _ = ensure_persona_version(
+                self._connection,
+                persona,
+                profile_id=self._profile_id,
+                created_at=self._timestamp(),
             )
-            row = self._connection.execute(
-                "SELECT id FROM persona WHERE profile_id = ? AND key = ?",
-                (self._profile_id, persona.key),
-            ).fetchone()
-        return int(row["id"])
+        return persona_id
+
+    def persona_version_for_identity(
+        self,
+        key: str,
+        identity_version: int,
+    ):
+        row = self._connection.execute(
+            """
+            SELECT version.id, version.persona_id, persona.key,
+                version.display_name, version.identity_prompt,
+                version.identity_version, version.voice_json,
+                version.content_hash, version.created_at
+            FROM persona_version AS version
+            JOIN persona ON persona.id = version.persona_id
+            WHERE persona.profile_id = ? AND persona.key = ?
+                AND version.identity_version = ?
+            """,
+            (self._profile_id, key, identity_version),
+        ).fetchone()
+        return None if row is None else persona_version_from_row(row)
 
     def persona_id_for_key(self, key: str) -> int | None:
         row = self._connection.execute(
@@ -410,6 +412,41 @@ class SQLiteMemoryStore:
         ).fetchall()
         return tuple(_extraction_run_from_row(row) for row in rows)
 
+    def list_extraction_runs_for_lane(
+        self,
+        *,
+        owner_user_id: int,
+        persona_session_id: int,
+    ) -> tuple[MemoryExtractionRun, ...]:
+        _validate_positive_ids(owner_user_id, persona_session_id)
+        rows = self._connection.execute(
+            """
+            SELECT extraction.*
+            FROM memory_extraction_run AS extraction
+            JOIN session ON session.id = extraction.session_id
+            WHERE extraction.owner_user_id = ?
+                AND session.owner_user_id = ?
+                AND session.persona_session_id = ?
+            ORDER BY extraction.id ASC
+            """,
+            (owner_user_id, owner_user_id, persona_session_id),
+        ).fetchall()
+        return tuple(_extraction_run_from_row(row) for row in rows)
+
+    def extraction_lane_ids_for_user(self, *, owner_user_id: int) -> tuple[int, ...]:
+        _validate_positive_ids(owner_user_id)
+        rows = self._connection.execute(
+            """
+            SELECT DISTINCT session.persona_session_id
+            FROM memory_extraction_run AS extraction
+            JOIN session ON session.id = extraction.session_id
+            WHERE extraction.owner_user_id = ? AND session.owner_user_id = ?
+            ORDER BY session.persona_session_id ASC
+            """,
+            (owner_user_id, owner_user_id),
+        ).fetchall()
+        return tuple(int(row[0]) for row in rows)
+
     def claim_extraction_run(
         self,
         run_id: int,
@@ -501,6 +538,22 @@ class SQLiteMemoryStore:
             attempt_increment=0,
             error_kind=None,
             conflict_message="extraction run is terminal or not processing",
+        )
+
+    def recover_extraction_run(
+        self,
+        run_id: int,
+        *,
+        owner_user_id: int,
+    ) -> MemoryExtractionRun:
+        return self._transition_extraction_run(
+            run_id,
+            owner_user_id=owner_user_id,
+            expected_status=ExtractionRunStatus.PROCESSING,
+            status=ExtractionRunStatus.PENDING,
+            attempt_increment=0,
+            error_kind=None,
+            conflict_message="extraction run is not recoverable",
         )
 
     def has_blocking_extraction_runs(
@@ -709,6 +762,17 @@ class SQLiteMemoryStore:
             (user_id, page_size, offset),
         ).fetchall()
         return tuple(self._memory_from_row(row) for row in rows)
+
+    def count_for_user(self, *, user_id: int) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM memory
+            WHERE user_id = ? AND status = 'active'
+            """,
+            (user_id,),
+        ).fetchone()
+        return int(row["total"])
 
     def update(
         self,

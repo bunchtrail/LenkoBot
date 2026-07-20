@@ -1,7 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-import sqlite3
 
 from .sqlite_schema import open_state_database
 

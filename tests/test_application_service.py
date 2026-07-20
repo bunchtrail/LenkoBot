@@ -1,7 +1,9 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from lenkobot.action_confirmation import SQLiteActionConfirmationStore
 from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
@@ -11,8 +13,22 @@ from lenkobot.session_store import (
     SQLiteSessionFinalizer,
     SQLiteSessionStore,
 )
-from lenkobot.telegram_presentation import TelegramResponseKind
-from lenkobot.telegram_router import IncomingTelegramMessage, SQLiteConversationStore, TelegramRouter
+from lenkobot.telegram_presentation import (
+    TelegramInlineButton,
+    TelegramResponseKind,
+    TelegramSentMessage,
+    confirmation_callback_data,
+    parse_confirmation_callback_data,
+    parse_forget_callback_data,
+    parse_memories_page_callback_data,
+    render_command_index,
+)
+from lenkobot.telegram_router import (
+    IncomingTelegramCallback,
+    IncomingTelegramMessage,
+    SQLiteConversationStore,
+    TelegramRouter,
+)
 from lenkobot.xai_provider import ProviderRequestError, XaiTextResponse
 
 
@@ -22,6 +38,57 @@ class RecordingResponsePort:
 
     async def send(self, response):
         self.responses.append(response)
+
+
+class EditableRecordingPort(RecordingResponsePort):
+    def __init__(self, *, edit_result=True, bound=None):
+        super().__init__()
+        self.edits = []
+        self.edit_result = edit_result
+        self.bound = bound
+
+    async def send(self, response):
+        await super().send(response)
+        return TelegramSentMessage(
+            chat_id=response.chat_id,
+            message_id=len(self.responses),
+        )
+
+    async def edit(self, handle, response):
+        self.edits.append((handle, response))
+        return self.edit_result
+
+    def bound_handle(self):
+        return self.bound
+
+
+class MutableClock:
+    def __init__(self):
+        self.now = datetime(2026, 7, 20, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now = self.now + timedelta(seconds=seconds)
+
+
+def confirmation_token(response, *, action="confirm"):
+    for row in response.inline_keyboard:
+        for button in row:
+            parsed = parse_confirmation_callback_data(button.callback_data)
+            if parsed is not None and parsed[0] == action:
+                return parsed[1]
+    raise AssertionError(f"{action} button not found in response keyboard")
+
+
+def telegram_callback(data, *, user_id=42, chat_id=500, chat_type="private"):
+    return IncomingTelegramCallback(
+        user_id=user_id,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        data=data,
+    )
 
 
 class RecordingProvider:
@@ -96,6 +163,8 @@ def build_service(
     session_store=None,
     extraction_service=None,
     session_finalizer=None,
+    confirmation_store="auto",
+    confirmation_clock=None,
 ):
     catalog = build_catalog(tmp_path)
     router = TelegramRouter(
@@ -104,6 +173,11 @@ def build_service(
         reply_port=RecordingResponsePort(),
         persona_catalog=catalog,
     )
+    if confirmation_store == "auto":
+        confirmation_store = SQLiteActionConfirmationStore(
+            tmp_path / "state.db",
+            clock=confirmation_clock,
+        )
     return TelegramApplicationService(
         router=router,
         persona_catalog=catalog,
@@ -114,6 +188,7 @@ def build_service(
         session_store=session_store,
         extraction_service=extraction_service,
         session_finalizer=session_finalizer,
+        confirmation_store=confirmation_store,
     ), router
 
 
@@ -376,7 +451,9 @@ def test_persona_command_switches_lane_without_provider_call(tmp_path):
     assert router.route(telegram_message("check")).persona_key == "analyst"
 
 
-def test_persona_command_without_key_lists_catalog_without_provider_call(tmp_path):
+def test_persona_command_without_key_returns_display_name_picker_without_provider_call(
+    tmp_path,
+):
     provider = RecordingProvider(
         result=XaiTextResponse(
             response_id="resp-1",
@@ -393,9 +470,106 @@ def test_persona_command_without_key_lists_catalog_without_provider_call(tmp_pat
     assert result is None
     assert provider.prompts == []
     assert response_port.responses[0].kind is TelegramResponseKind.FINAL
-    assert response_port.responses[0].text == (
-        "Доступные персоны: companion (Companion), analyst (Analyst)."
+    assert response_port.responses[0].text == "Выбери персону: Companion, Analyst."
+    assert response_port.responses[0].inline_keyboard == (
+        (
+            TelegramInlineButton(
+                text="✓ Companion",
+                callback_data="persona:v1:companion",
+            ),
+        ),
+        (
+            TelegramInlineButton(
+                text="Analyst",
+                callback_data="persona:v1:analyst",
+            ),
+        ),
     )
+
+
+def test_persona_callback_switches_lane_without_provider_call(tmp_path):
+    provider = RecordingProvider()
+    response_port = RecordingResponsePort()
+    service, router = build_service(tmp_path, provider, response_port)
+
+    result = asyncio.run(
+        service.handle_callback(
+            IncomingTelegramCallback(
+                user_id=42,
+                chat_id=500,
+                chat_type="private",
+                data="persona:v1:analyst",
+            )
+        )
+    )
+
+    assert result is None
+    assert provider.prompts == []
+    assert response_port.responses[0].text == "Персона переключена: Analyst."
+    assert router.route(telegram_message("check")).persona_key == "analyst"
+
+
+def test_repeated_persona_callback_is_idempotent_for_active_version(tmp_path):
+    provider = RecordingProvider()
+    response_port = RecordingResponsePort()
+    service, router = build_service(tmp_path, provider, response_port)
+    callback = IncomingTelegramCallback(
+        user_id=42,
+        chat_id=500,
+        chat_type="private",
+        data="persona:v1:analyst",
+    )
+
+    asyncio.run(service.handle_callback(callback))
+    lane_after_first = router.current_lane(telegram_message("inspect"))
+    asyncio.run(service.handle_callback(callback))
+    lane_after_second = router.current_lane(telegram_message("inspect"))
+
+    assert lane_after_first.session_id == lane_after_second.session_id
+    assert response_port.responses[1].text == "Персона переключена: Analyst."
+
+
+def test_unauthorized_or_malformed_persona_callback_has_no_state_or_provider_side_effect(
+    tmp_path,
+):
+    provider = RecordingProvider()
+    response_port = RecordingResponsePort()
+    service, router = build_service(tmp_path, provider, response_port)
+
+    asyncio.run(
+        service.handle_callback(
+            IncomingTelegramCallback(
+                user_id=99,
+                chat_id=500,
+                chat_type="private",
+                data="persona:v1:analyst",
+            )
+        )
+    )
+    asyncio.run(
+        service.handle_callback(
+            IncomingTelegramCallback(
+                user_id=42,
+                chat_id=500,
+                chat_type="group",
+                data="persona:v1:analyst",
+            )
+        )
+    )
+    asyncio.run(
+        service.handle_callback(
+            IncomingTelegramCallback(
+                user_id=42,
+                chat_id=500,
+                chat_type="private",
+                data="persona:v2:analyst",
+            )
+        )
+    )
+
+    assert provider.prompts == []
+    assert response_port.responses[-1].kind is TelegramResponseKind.ERROR
+    assert router.current_lane(telegram_message("inspect")) is None
 
 
 def test_invalid_or_unauthorized_commands_do_not_change_state_or_call_provider(tmp_path):
@@ -443,7 +617,19 @@ def test_start_and_help_return_command_index_without_provider_call(tmp_path, com
     assert response_port.responses[0].kind is TelegramResponseKind.FINAL
     assert "/remember <text>" in response_port.responses[0].text
     assert "/memories [page]" in response_port.responses[0].text
-    assert "/forget <id>" in response_port.responses[0].text
+    assert "/forget [id]" in response_port.responses[0].text
+
+
+def test_help_returns_exact_index_and_start_prepends_voice_greeting(tmp_path):
+    response_port = RecordingResponsePort()
+    service, _ = build_service(tmp_path, RecordingProvider(), response_port)
+
+    asyncio.run(service.handle(telegram_message("/help")))
+    asyncio.run(service.handle(telegram_message("/start")))
+
+    assert response_port.responses[0].text == render_command_index()
+    assert response_port.responses[1].text.endswith(render_command_index())
+    assert response_port.responses[1].text != render_command_index()
 
 
 def test_new_closes_current_session_and_next_turn_uses_summary(tmp_path):
@@ -488,12 +674,24 @@ def test_new_closes_current_session_and_next_turn_uses_summary(tmp_path):
     memory_store.complete_extraction_run(run.id, owner_user_id=42)
 
     asyncio.run(service.handle(telegram_message("/new")))
+    prompt = response_port.responses[-1]
+    assert summary_generator.calls == 0
+
+    asyncio.run(
+        service.handle_callback(
+            telegram_callback(
+                confirmation_callback_data(
+                    "confirm",
+                    confirmation_token(prompt),
+                )
+            )
+        )
+    )
     asyncio.run(service.handle(telegram_message("Next")))
 
+    texts = [response.text for response in response_port.responses]
     assert summary_generator.calls == 1
-    assert response_port.responses[2].text == (
-        "Разговор закрыт. Следующее сообщение начнёт новый."
-    )
+    assert "Разговор закрыт. Следующее сообщение начнёт новый." in texts
     assert "UNTRUSTED CLOSED SESSION SUMMARY" in provider.prompts[-1]
     assert "A bounded summary" in provider.prompts[-1]
     assert provider.prompts[-1].endswith("User message:\nNext")
@@ -523,12 +721,22 @@ def test_memory_commands_create_list_and_delete_only_owned_shared_records(tmp_pa
     assert memory_store.delete(record.id, user_id=99) is False
     asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
 
+    prompt = response_port.responses[2]
+    assert memory_store.get(record.id, user_id=42) is not None
+    asyncio.run(
+        service.handle_callback(
+            telegram_callback(
+                confirmation_callback_data("confirm", confirmation_token(prompt))
+            )
+        )
+    )
+
     assert record.scope is MemoryScope.SHARED
     assert record.kind == "fact"
     assert record.content == "User likes tea"
     assert response_port.responses[0].text == "Запомнил: User likes tea."
     assert "[shared] User likes tea" in response_port.responses[1].text
-    assert response_port.responses[2].text == f"Удалено: запись {record.id}."
+    assert response_port.responses[3].text == f"Удалено: запись {record.id}."
     assert memory_store.get(record.id, user_id=42) is None
     assert provider.prompts == []
 
@@ -555,7 +763,7 @@ def test_memory_commands_validate_arguments_and_page(tmp_path):
     ]
     assert response_port.responses[0].text == "Формат команды: /remember <text>."
     assert response_port.responses[1].text == "Номер страницы должен быть положительным."
-    assert response_port.responses[2].text == "Формат команды: /forget <id>."
+    assert response_port.responses[2].text == "Формат команды: /forget [id]."
     assert provider.prompts == []
 
 
@@ -828,3 +1036,376 @@ class RecordingContextBuilder:
     def build(self, **kwargs):
         self.calls.append(kwargs)
         return "prompt"
+
+def test_chat_turn_edits_status_message_into_final(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Long answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = EditableRecordingPort()
+    service, _ = build_service(tmp_path, provider, response_port)
+
+    result = asyncio.run(service.handle(telegram_message("hello")))
+
+    assert result.text == "Long answer"
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.STATUS
+    ]
+    assert len(response_port.edits) == 1
+    handle, edited = response_port.edits[0]
+    assert handle == TelegramSentMessage(chat_id=500, message_id=1)
+    assert edited.kind is TelegramResponseKind.FINAL
+    assert edited.text == "Long answer"
+
+
+def test_chat_turn_falls_back_to_new_message_when_edit_fails(tmp_path):
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Long answer",
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = EditableRecordingPort(edit_result=False)
+    service, _ = build_service(tmp_path, provider, response_port)
+
+    asyncio.run(service.handle(telegram_message("hello")))
+
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.STATUS,
+        TelegramResponseKind.FINAL,
+    ]
+    assert response_port.responses[-1].text == "Long answer"
+    assert len(response_port.edits) == 1
+
+
+def test_provider_failure_edits_status_into_generic_error(tmp_path):
+    provider = RecordingProvider(
+        error=ProviderRequestError(
+            "request failed",
+            status=500,
+            code="server_error",
+            raw_body='{"token":"raw-provider-secret"}',
+            headers={},
+        )
+    )
+    response_port = EditableRecordingPort()
+    service, _ = build_service(tmp_path, provider, response_port)
+
+    asyncio.run(service.handle(telegram_message("hello")))
+
+    assert len(response_port.edits) == 1
+    _, edited = response_port.edits[0]
+    assert edited.kind is TelegramResponseKind.ERROR
+    assert "raw-provider-secret" not in edited.text
+
+
+def test_long_answer_replaces_status_with_first_chunk_and_sends_rest(tmp_path):
+    long_text = ("a" * 3000) + "\n\n" + ("b" * 3000)
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text=long_text,
+            credential_source="xai_oauth",
+        )
+    )
+    response_port = EditableRecordingPort()
+    service, _ = build_service(tmp_path, provider, response_port)
+
+    asyncio.run(service.handle(telegram_message("hello")))
+
+    _, edited = response_port.edits[0]
+    assert edited.text == "a" * 3000
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.STATUS,
+        TelegramResponseKind.FINAL,
+    ]
+    assert response_port.responses[-1].text == "b" * 3000
+
+
+def test_new_cancel_keeps_session_active(tmp_path):
+    database_path = tmp_path / "state.db"
+    session_store = SQLiteSessionStore(database_path)
+    finalizer = SQLiteSessionFinalizer(
+        database_path,
+        FixedSummaryGenerator(),
+        extraction_store=SQLiteMemoryStore(database_path),
+    )
+    response_port = RecordingResponsePort()
+    service, router = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        session_store=session_store,
+        session_finalizer=finalizer,
+    )
+    asyncio.run(service.handle(telegram_message("First")))
+    lane = router.route(telegram_message("inspect"))
+
+    asyncio.run(service.handle(telegram_message("/new")))
+    prompt = response_port.responses[-1]
+    asyncio.run(
+        service.handle_callback(
+            telegram_callback(
+                confirmation_callback_data("cancel", confirmation_token(prompt, action="cancel"))
+            )
+        )
+    )
+
+    assert response_port.responses[-1].text == "Отменено."
+    assert (
+        session_store.active_session_for_lane(
+            user_id=42,
+            persona_session_id=lane.session_id,
+        )
+        is not None
+    )
+
+
+def test_confirmation_replay_does_not_repeat_action(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+    asyncio.run(service.handle(telegram_message("/remember one")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+    asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
+    token = confirmation_token(response_port.responses[-1])
+    callback = telegram_callback(confirmation_callback_data("confirm", token))
+
+    asyncio.run(service.handle_callback(callback))
+    asyncio.run(service.handle_callback(callback))
+
+    texts = [response.text for response in response_port.responses]
+    assert texts.count(f"Удалено: запись {record.id}.") == 1
+    assert response_port.responses[-1].kind is TelegramResponseKind.ERROR
+    assert "устарела" in response_port.responses[-1].text
+
+
+def test_expired_confirmation_does_not_execute(tmp_path):
+    clock = MutableClock()
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+        confirmation_clock=clock,
+    )
+    asyncio.run(service.handle(telegram_message("/remember one")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+    asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
+    token = confirmation_token(response_port.responses[-1])
+
+    clock.advance(301)
+    asyncio.run(
+        service.handle_callback(
+            telegram_callback(confirmation_callback_data("confirm", token))
+        )
+    )
+
+    assert "устарела" in response_port.responses[-1].text
+    assert memory_store.get(record.id, user_id=42) is not None
+
+
+def test_forget_without_id_lists_records_with_delete_buttons(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+    asyncio.run(service.handle(telegram_message("/remember first")))
+    asyncio.run(service.handle(telegram_message("/remember second")))
+    records = memory_store.list_for_user(user_id=42, page=1, page_size=5)
+
+    asyncio.run(service.handle(telegram_message("/forget")))
+
+    response = response_port.responses[-1]
+    assert "Выбери запись для удаления:" in response.text
+    button_data = [
+        parse_forget_callback_data(button.callback_data)
+        for row in response.inline_keyboard
+        for button in row
+    ]
+    assert sorted(button_data) == sorted(record.id for record in records)
+
+
+def test_forget_delete_button_opens_confirmation_prompt(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+    asyncio.run(service.handle(telegram_message("/remember one")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+
+    asyncio.run(
+        service.handle_callback(telegram_callback(f"forget:v1:{record.id}"))
+    )
+
+    prompt = response_port.responses[-1]
+    assert "Удалить запись" in prompt.text
+    assert memory_store.get(record.id, user_id=42) is not None
+    confirmation_token(prompt)
+
+
+def test_forget_unknown_id_reports_not_found_without_confirmation(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+
+    asyncio.run(service.handle(telegram_message("/forget 999")))
+
+    assert response_port.responses[-1].kind is TelegramResponseKind.ERROR
+    assert response_port.responses[-1].text == "Запись памяти не найдена."
+
+
+def test_confirmed_forget_reports_when_record_already_deleted(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+    asyncio.run(service.handle(telegram_message("/remember one")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+    asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
+    token = confirmation_token(response_port.responses[-1])
+    assert memory_store.delete(record.id, user_id=42) is True
+
+    asyncio.run(
+        service.handle_callback(
+            telegram_callback(confirmation_callback_data("confirm", token))
+        )
+    )
+
+    assert response_port.responses[-1].text == "Запись уже удалена."
+
+
+def test_memories_pagination_buttons_and_page_callback_edits_in_place(tmp_path):
+    response_port = EditableRecordingPort(
+        bound=TelegramSentMessage(chat_id=500, message_id=77)
+    )
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    service, _ = build_service(
+        tmp_path,
+        RecordingProvider(),
+        response_port,
+        memory_store=memory_store,
+    )
+    for index in range(6):
+        memory_store.create(
+            NewMemory(
+                user_id=42,
+                scope=MemoryScope.SHARED,
+                kind="fact",
+                content=f"memory-{index}",
+                updated_at=f"2026-07-19T10:{index:02d}:00+00:00",
+            )
+        )
+
+    asyncio.run(service.handle(telegram_message("/memories")))
+
+    page_one = response_port.responses[-1]
+    assert page_one.text.startswith("Память, страница 1 из 2:")
+    page_one_data = [
+        button.callback_data
+        for row in page_one.inline_keyboard
+        for button in row
+    ]
+    assert page_one_data == ["mem:v1:2"]
+
+    asyncio.run(service.handle_callback(telegram_callback("mem:v1:2")))
+
+    handle, edited = response_port.edits[-1]
+    assert handle == TelegramSentMessage(chat_id=500, message_id=77)
+    assert edited.text.startswith("Память, страница 2 из 2:")
+    page_two_data = [
+        button.callback_data
+        for row in edited.inline_keyboard
+        for button in row
+    ]
+    assert page_two_data == ["mem:v1:1"]
+    assert parse_memories_page_callback_data(page_two_data[0]) == 1
+
+
+def test_persona_callback_edits_picker_in_place(tmp_path):
+    response_port = EditableRecordingPort(
+        bound=TelegramSentMessage(chat_id=500, message_id=55)
+    )
+    service, router = build_service(tmp_path, RecordingProvider(), response_port)
+
+    asyncio.run(
+        service.handle_callback(telegram_callback("persona:v1:analyst"))
+    )
+
+    assert response_port.responses == []
+    handle, edited = response_port.edits[-1]
+    assert handle == TelegramSentMessage(chat_id=500, message_id=55)
+    assert edited.text == "Выбери персону: Companion, Analyst."
+    button_texts = [
+        button.text for row in edited.inline_keyboard for button in row
+    ]
+    assert button_texts == ["Companion", "✓ Analyst"]
+    assert router.route(telegram_message("check")).persona_key == "analyst"
+
+
+def test_new_and_forget_are_unavailable_without_confirmation_store(tmp_path):
+    response_port = RecordingResponsePort()
+    memory_store = SQLiteMemoryStore(tmp_path / "state.db")
+    session_store = SQLiteSessionStore(tmp_path / "state.db")
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="grok-4.5",
+            text="Answer",
+            credential_source="xai_oauth",
+        )
+    )
+    service, _ = build_service(
+        tmp_path,
+        provider,
+        response_port,
+        memory_store=memory_store,
+        session_store=session_store,
+        session_finalizer=SQLiteSessionFinalizer(
+            tmp_path / "state.db",
+            FixedSummaryGenerator(),
+            extraction_store=memory_store,
+        ),
+        confirmation_store=None,
+    )
+    asyncio.run(service.handle(telegram_message("/remember one")))
+    record = memory_store.list_for_user(user_id=42, page=1, page_size=5)[0]
+    asyncio.run(service.handle(telegram_message("open a session")))
+
+    asyncio.run(service.handle(telegram_message(f"/forget {record.id}")))
+    asyncio.run(service.handle(telegram_message("/new")))
+
+    assert response_port.responses[-2].text == "Подтверждения сейчас недоступны."
+    assert response_port.responses[-1].text == "Подтверждения сейчас недоступны."
+    assert memory_store.get(record.id, user_id=42) is not None

@@ -217,6 +217,56 @@ class _TelethonE2ETransport:
         finally:
             self._client.remove_event_handler(handle, event_filter)
 
+    async def click_button(
+        self,
+        message_id: int,
+        *,
+        button_text: str,
+    ) -> TelegramE2EMessage:
+        try:
+            prompt = await self._fetch_message(message_id)
+            original_text = getattr(prompt, "raw_text", None)
+            if (
+                prompt is None
+                or getattr(prompt, "id", None) != message_id
+                or not isinstance(original_text, str)
+            ):
+                raise TelegramE2EError("Telegram E2E confirmation prompt is invalid")
+            await prompt.click(text=button_text)
+            waited = 0.0
+            interval = 0.5
+            while True:
+                updated = await self._fetch_message(message_id)
+                new_text = (
+                    getattr(updated, "raw_text", None)
+                    if updated is not None
+                    else None
+                )
+                if (
+                    updated is not None
+                    and getattr(updated, "id", None) == message_id
+                    and isinstance(new_text, str)
+                    and new_text
+                    and new_text != original_text
+                ):
+                    return TelegramE2EMessage(id=message_id, text=new_text)
+                if waited >= self._timeout_seconds:
+                    raise TelegramE2EError(
+                        "Telegram E2E confirmation edit timed out"
+                    )
+                await asyncio.sleep(interval)
+                waited += interval
+        except TelegramE2EError:
+            raise
+        except Exception:
+            raise TelegramE2EError("Telegram E2E button click failed") from None
+
+    async def _fetch_message(self, message_id: int) -> Any:
+        result = await self._client.get_messages(self._bot, ids=message_id)
+        if isinstance(result, list):
+            return result[0] if result else None
+        return result
+
     async def close(self) -> None:
         try:
             await self._client.disconnect()

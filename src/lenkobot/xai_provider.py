@@ -3,7 +3,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import json
-from typing import Protocol
+from typing import Protocol, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -216,6 +216,15 @@ class EntitlementDenied(ProviderRequestError):
 
 class UntrustedInferenceHost(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class XaiInputMessage:
+    role: str
+    content: str
+
+
+XaiPrompt: TypeAlias = str | tuple[XaiInputMessage, ...]
 
 
 class JsonHttpClient(Protocol):
@@ -469,7 +478,7 @@ class ResponsesTransport(Protocol):
         self,
         credential: BearerCredential,
         model: str,
-        prompt: str,
+        prompt: XaiPrompt,
     ) -> XaiTextResponse: ...
 
 
@@ -501,7 +510,7 @@ class XaiResponsesTransport:
         self,
         credential: BearerCredential,
         model: str,
-        prompt: str,
+        prompt: XaiPrompt,
     ) -> XaiTextResponse:
         response, body = self._post_response(
             credential,
@@ -564,12 +573,15 @@ class XaiResponsesTransport:
         self,
         credential: BearerCredential,
         model: str,
-        prompt: str,
+        prompt: XaiPrompt,
         *,
         response_format: dict[str, object] | None = None,
     ) -> tuple[HttpResponse, dict[str, object]]:
         endpoint = self._responses_endpoint(credential.base_url)
-        payload: dict[str, object] = {"model": model, "input": prompt}
+        payload: dict[str, object] = {
+            "model": model,
+            "input": _serialize_input(prompt),
+        }
         if response_format is not None:
             payload["text"] = {"format": response_format}
         response = self._http_client.post_json(
@@ -682,6 +694,8 @@ class XaiResponsesTransport:
 
 
 class XaiProvider:
+    supports_message_input = True
+
     def __init__(
         self,
         transport: ResponsesTransport,
@@ -704,7 +718,7 @@ class XaiProvider:
         self._api_key_source = api_key_source
         self._model = model
 
-    def respond(self, prompt: str) -> XaiTextResponse:
+    def respond(self, prompt: XaiPrompt) -> XaiTextResponse:
         if self._policy is CredentialPolicy.API_KEY_ONLY:
             return self._complete(self._api_key_source, prompt)
         if self._policy is CredentialPolicy.OAUTH_ONLY:
@@ -725,7 +739,7 @@ class XaiProvider:
     def _complete(
         self,
         source: CredentialSource | None,
-        prompt: str,
+        prompt: XaiPrompt,
     ) -> XaiTextResponse:
         if source is None:
             raise CredentialUnavailable("credential source is not configured")
@@ -760,3 +774,20 @@ class XaiStructuredProvider:
             schema_name=schema_name,
             schema=schema,
         )
+
+
+def _serialize_input(prompt: XaiPrompt) -> str | list[dict[str, str]]:
+    if isinstance(prompt, str):
+        return prompt
+    if not isinstance(prompt, tuple) or not prompt:
+        raise ValueError("xAI input messages must be a non-empty tuple")
+    serialized: list[dict[str, str]] = []
+    for message in prompt:
+        if not isinstance(message, XaiInputMessage):
+            raise ValueError("xAI input contains an invalid message")
+        if message.role not in {"system", "user", "assistant"}:
+            raise ValueError("xAI input contains an invalid role")
+        if not message.content.strip():
+            raise ValueError("xAI input message content cannot be empty")
+        serialized.append({"role": message.role, "content": message.content})
+    return serialized

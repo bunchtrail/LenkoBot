@@ -398,6 +398,9 @@ def test_owned_memory_listing_is_paginated_ordered_and_excludes_deleted_records(
 
     assert contents(first_page) == ("memory-5", "memory-4")
     assert contents(second_page) == ("memory-3", "memory-1")
+    assert store.count_for_user(user_id=42) == 5
+    assert store.count_for_user(user_id=99) == 1
+    assert store.count_for_user(user_id=7) == 0
 
 
 def test_owned_memory_listing_includes_all_scopes(tmp_path):

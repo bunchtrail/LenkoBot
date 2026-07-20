@@ -173,6 +173,102 @@ def test_version_three_database_adds_session_schema_without_rewriting_lane_ids(t
     migrated.close()
 
 
+def test_persona_version_migration_seeds_existing_persona_and_lane_reference(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE conversation (
+            id INTEGER PRIMARY KEY,
+            platform TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            active_persona_key TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(platform, chat_id)
+        );
+        CREATE TABLE persona_session (
+            id INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversation(id),
+            persona_key TEXT NOT NULL,
+            identity_version INTEGER NOT NULL,
+            UNIQUE(conversation_id, persona_key, identity_version)
+        );
+        CREATE TABLE persona (
+            id INTEGER PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            identity_prompt TEXT NOT NULL,
+            identity_version INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            UNIQUE(profile_id, key)
+        );
+        INSERT INTO conversation (
+            id, platform, chat_id, active_persona_key, version
+        ) VALUES (7, 'telegram', 500, 'companion', 3);
+        INSERT INTO persona_session (
+            id, conversation_id, persona_key, identity_version
+        ) VALUES (11, 7, 'companion', 1);
+        INSERT INTO persona (
+            id, profile_id, key, display_name, identity_prompt, identity_version
+        ) VALUES (13, 'default', 'companion', 'Companion', 'A calm companion.', 1);
+        PRAGMA user_version = 5;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = SQLiteConversationStore(database_path)
+    version = store.persona_version_for_lane(11)
+    store.close()
+
+    assert version is not None
+    assert version.persona_id == 13
+    assert version.identity_version == 1
+    assert version.identity_prompt == "A calm companion."
+
+
+def test_persona_version_retention_protects_lanes_and_skips_orphan_reaping(tmp_path):
+    database_path = tmp_path / "state.db"
+    store = SQLiteConversationStore(database_path)
+    turn = store.route_message(
+        IncomingTelegramMessage(
+            user_id=42,
+            chat_id=500,
+            chat_type="private",
+            text="hello",
+        ),
+        catalog(),
+    )
+    version = store.persona_version_for_lane(turn.session_id)
+    store.close()
+
+    assert version is not None
+    connection = open_state_database(database_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "DELETE FROM persona_version WHERE id = ?",
+            (version.id,),
+        )
+    connection.rollback()
+
+    connection.execute(
+        "DELETE FROM persona_session WHERE id = ?",
+        (turn.session_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = open_state_database(database_path)
+    retained = reopened.execute(
+        "SELECT id FROM persona_version WHERE id = ?",
+        (version.id,),
+    ).fetchone()
+    reopened.close()
+
+    assert retained is not None
+
+
 def test_phase_two_lifecycle_schema_is_additive_and_preserves_existing_rows(tmp_path):
     database_path = tmp_path / "state.db"
     connection = sqlite3.connect(database_path)

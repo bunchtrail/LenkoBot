@@ -33,7 +33,7 @@
 ## Наблюдаемое поведение
 
 1. Бот принимает сообщения только от configured Telegram user ID. Неавторизованные сообщения, callbacks и команды не создают сессию и не доходят до агента.
-2. Пользователь выбирает активную персону через `/persona <name>`. Inline keyboard появляется только в Phase 4. Переключение атомарно меняет active persona routing lane.
+2. Пользователь выбирает активную персону через `/persona`: Telegram показывает inline keyboard с `display_name`, а `/persona <key>` остаётся текстовым fallback для owner tooling. Переключение атомарно меняет active persona routing lane.
 3. Каждый ход собирает context из identity активной персоны, shared memory, private memory персоны и её relationship с пользователем. Durable recent transcript добавляется только в Phase 1.
 4. Бот показывает безопасные статусы, например «Проверяю сведения» или «Готовлю ответ», и завершает ответом с коротким итогом выполненных действий. `/start` и `/help` возвращают bounded command index.
 
@@ -177,10 +177,11 @@ IncomingTelegramMessage
 
 `Confirmed`: transport dependency зафиксирована на `aiogram==3.29.1` (MIT, Python 3.13, Bot API 10.1). Domain router не импортирует SDK types.
 
-- `AiogramTelegramAdapter` преобразует только update с `from_user`, `chat` и text в `IncomingTelegramMessage`.
+- `AiogramTelegramAdapter` преобразует update с `from_user`, `chat` и text в `IncomingTelegramMessage`, а owner/private callback с message — в `IncomingTelegramCallback`.
 - `chat_type` передаётся без нормализации в domain authorization gate; private-only policy остаётся единственным владельцем допуска.
-- Отсутствующие user/chat/text отбрасываются до domain dispatch. Callback, inline, media и channel updates не регистрируются в этой вертикали.
-- `create_dispatcher` регистрирует только `message`; `run_polling` передаёт в Telegram API именно зарегистрированный список update types.
+- Отсутствующие user/chat/text отбрасываются до domain dispatch; callback без message также отбрасывается после завершения callback query. Inline, media и channel updates не регистрируются в этой вертикали.
+- `create_dispatcher` регистрирует `message` и `callback_query` только для application handler, который поддерживает callback contract; legacy message-only router получает только `message`. `run_polling` передаёт в Telegram API именно зарегистрированный список update types.
+- На старте `run_polling` owner-scoped регистрирует bounded command menu через `set_my_commands` с `BotCommandScopeChat(allowed_user_id)`. Ошибка регистрации является startup error и не запускает polling с устаревшим управлением.
 - Adapter не запускает model/provider и не формирует искусственный ответ. `TelegramRouter` передаёт `RoutedTurn` в следующий internal port.
 
 ## xAI provider boundary
@@ -189,7 +190,14 @@ IncomingTelegramMessage
 
 - `CredentialSource` возвращает bearer, expiry, base URL и source identity. API-key source использует direct `https://api.x.ai/v1`; OAuth source получает access token через refresh coordinator и требует explicit base URL.
 - Bearer values не появляются в `repr`, errors или result objects. Transport принимает только HTTPS endpoint на default port с host из explicit allowlist; default allowlist содержит `api.x.ai`.
-- Minimal request имеет `model` и string `input`. Final text собирается только из assistant `message` items и `output_text` parts; reasoning и неизвестные items пропускаются.
+- Minimal request имеет `model` и string `input` для legacy provider doubles, либо
+  typed role-structured `input` для Phase 2.5 runtime foundation. Final text
+  собирается только из assistant `message` items и `output_text` parts; reasoning
+  и неизвестные items пропускаются.
+- `system`, `user` и `assistant` являются единственными допустимыми ролями для
+  typed input; транспорт fail-closed отклоняет остальные. Non-sensitive OAuth
+  live smoke с `system` role для `grok-4.5` успешно выполнен 19 июля 2026;
+  raw prompt и response не сохранялись.
 - Provider result содержит credential source и `fallback_from`, чтобы presentation layer мог явно уведомить пользователя о переходе на платный API key.
 - `oauth_then_api_key` требует обе configured credential sources и переключается только после typed `EntitlementDenied`. Generic `401`, raw `403`, `429`, network failure и `5xx` не запускают fallback.
 - Transport по умолчанию не угадывает entitlement по undocumented response body. Подтверждённый classifier может быть injected отдельно без изменения policy owner.
@@ -206,10 +214,11 @@ IncomingTelegramMessage
 
 - `lenkobot login --config <path>` валидирует non-secret TOML config, использует configured OAuth client ID или approved local reference default, показывает verification URL и user code, затем завершает device polling и сохраняет state через Credential Manager. Он не открывает браузер автоматически и не печатает device/access/refresh token.
 - `lenkobot run --config <path> [--data-root <path>]` читает Telegram bot token только из `TELEGRAM_BOT_TOKEN`. Отсутствующий/пустой secret, OAuth state, Telegram allowlist или persona config останавливает запуск до создания `Bot` или polling.
-- `lenkobot live-smoke --config <path> --data-root <fresh-external-path> --confirm-send` синтетически проводит owner/private команды `/start`, `/help`, `/persona`, `/remember`, `/memories` и `/forget` через production application/router/memory contracts и доставляет проверенные typed responses реальному владельцу через Telegram Bot API. Target нельзя переопределить: он всегда равен `[telegram].allowed_user_id`; token читается только из `TELEGRAM_BOT_TOKEN`; data root должен быть новым leaf внутри уже существующего каталога и находиться вне config tree. State создаётся и открывается до первого network call. Provider и OAuth не вызываются, сообщения помечаются `[SMOKE]`, а любая неожиданная response shape или delivery error останавливает сценарий без retry.
+- `lenkobot chat --config <path> --data-root <explicit-path> --message <text>` поднимает тот же production composition root (persona, memory, extraction, OAuth-only provider) без Telegram polling и bot token: synthetic owner/private message обрабатывается через application service, финальный ответ печатается в stdout, состояние сохраняется в указанном data root между вызовами. Команда предназначена для локальной owner acceptance проверки и не заменяет live-smoke или E2E.
+- `lenkobot live-smoke --config <path> --data-root <fresh-external-path> --confirm-send` синтетически проводит owner/private команды `/start`, `/help`, `/persona`, `/remember`, `/memories` и `/forget` через production application/router/memory contracts, включая one-time confirmation callback для `/forget`, и доставляет проверенные typed responses реальному владельцу через Telegram Bot API. Target нельзя переопределить: он всегда равен `[telegram].allowed_user_id`; token читается только из `TELEGRAM_BOT_TOKEN`; data root должен быть новым leaf внутри уже существующего каталога и находиться вне config tree. State создаётся и открывается до первого network call. Provider и OAuth не вызываются, сообщения помечаются `[SMOKE]`, а любая неожиданная response shape или delivery error останавливает сценарий без retry.
 - `live-smoke` доказывает command behavior, persistence semantics и реальный Telegram outbound, но не доказывает получение update через long polling. Он остаётся быстрой отдельной проверкой и не подменяет полный MTProto E2E.
 - `lenkobot telegram-e2e-login --config <e2e-path>` вручную авторизует только выделенный test user через optional pinned Telethon dependency, проверяет полученный user ID против `[telegram].allowed_user_id` до persistence и сохраняет `api_id`, `api_hash`, user ID и serialized user session в отдельный versioned Windows Credential Manager target. Phone, login code и 2FA password не сохраняются; secret input, session и raw upstream errors не выводятся.
-- `lenkobot telegram-e2e --config <e2e-path> --confirm-send` проверяет credential user, resolve-ит `[telegram_e2e].bot_username`, pin-ит immutable `[telegram_e2e].bot_user_id`, последовательно отправляет фиксированный command corpus и принимает только новые incoming private replies exact bot ID с `reply_to_msg_id`, равным ID конкретной sent command. Timeout, duplicate/unexpected response, identity mismatch, concurrent dialog activity или transport error останавливают run без retry; report содержит только exact-safe либо нормализованные ответы.
+- `lenkobot telegram-e2e --config <e2e-path> --confirm-send` проверяет credential user, resolve-ит `[telegram_e2e].bot_username`, pin-ит immutable `[telegram_e2e].bot_user_id`, последовательно отправляет фиксированный command corpus и принимает только новые incoming private replies exact bot ID с `reply_to_msg_id`, равным ID конкретной sent command. Для confirmation flow E2E нажимает inline кнопку подтверждения и принимает edited prompt message как результат действия. Timeout, duplicate/unexpected response, identity mismatch, concurrent dialog activity или transport error останавливают run без retry; report содержит только exact-safe либо нормализованные ответы.
 - Пользователь выбрал временное использование текущего bot identity вместо отдельного staging bot. На время E2E обычный poller должен быть остановлен; `lenkobot telegram-e2e-bot --config <e2e-path> --data-root <fresh-external-path> --confirm-run` сначала сверяет Bot API `getMe` с pinned bot ID, затем атомарно создаёт новый external state root и запускает тот же token с test-user allowlist и E2E-only response port, который отвечает Telegram reply на исходный command message. После проверки E2E process останавливается и production config/poller восстанавливаются. Production `config.toml` и production `state.db` не изменяются.
 - Cross-client equality Bot API reply target и Telethon sent-message ID является `Assumed` до первого live E2E: public API подтверждает оба поля, но не формулирует их численное равенство между clients. Mismatch завершается fail-closed и не ослабляется временной эвристикой.
 - Полный E2E является manual local gate и не запускается в CI. Test account/dialog не используются параллельно вручную; CLI не принимает target, chat, command, session или credential overrides.
@@ -224,11 +233,15 @@ IncomingTelegramMessage
 - `TelegramApplicationService` сначала пропускает message через private-only authorization и router. Неавторизованные messages и commands, group chat или отсутствующий `chat_type` не создают state, не вызывают provider и не отправляют response.
 - Обычный text turn строит временный prompt из `identity_prompt` активной persona и текста пользователя. Memory, transcript context и tools подключаются отдельными вертикалями и не имитируются этим prompt.
 - Blocking provider call выполняется вне aiogram event loop. Provider error превращается в безопасный generic error response; raw body, bearer и внутренний error code пользователю не передаются.
-- `TelegramResponse` содержит explicit `chat_id`, `kind` (`status`, `notice`, `final`, `error`) и text. До provider отправляется короткий status, затем final assistant text.
+- `TelegramResponse` содержит explicit `chat_id`, `kind` (`status`, `notice`, `final`, `error`), text и optional typed inline keyboard. `TelegramResponsePort.send` возвращает `TelegramSentMessage` handle (`chat_id`, `message_id`) либо `None`, если порт не умеет адресовать отправленное. `edit(handle, response) -> bool` и `bound_handle()` являются optional port capability: `edit` со значением `False` обязывает sender отправить fallback новым сообщением, а Telegram `message is not modified` считается успешным no-op. Domain modules не содержат SDK types.
+- Обычный turn отправляет один status message до provider и заменяет его final/error текстом через `edit`; при недоступном или неудачном edit результат отправляется новым сообщением, не теряется и не создаёт повторный внешний эффект. Adapter дополнительно показывает Telegram typing action, пока turn ждёт provider; typing является adapter-only presentation detail.
+- Assistant final/error text разбивается bounded splitter'ом на сообщения не длиннее 4096 символов по границам абзац/строка/пробел с hard cut в конце; первый chunk заменяет status, остальные отправляются отдельными сообщениями. Command responses bounded по построению и не разбиваются.
 - Legacy typed `fallback_from` остаётся изолированной transport metadata, но strict `oauth_only` composition root её не создаёт и не выполняет переход на API key. Raw HTTP status или текст исключения тем более не являются основанием для fallback.
-- `/start` и `/help` возвращают один и тот же command index и не вызывают provider. `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. `/persona` показывает config-seeded catalog; неизвестные и malformed commands возвращают безопасную command error.
-- `/remember <text>` создаёт owner-scoped shared memory с kind `fact`; пустой текст и текст длиннее 500 символов отклоняются. `/memories [page]` показывает active memory records текущего пользователя всех scopes по 5 записей на страницу в порядке `updated_at DESC, id DESC`. `/forget <id>` выполняет owner-scoped physical delete. Все эти команды проходят private-only authorization и не вызывают provider.
-- Aiogram adapter может создать response port, связанный с исходным `Message`, либо fixed-owner outbound port для `live-smoke`; Bot API SDK types остаются только в adapter boundary. Telethon SDK types принадлежат отдельному optional E2E adapter и не входят в production runtime.
+- `/start` и `/help` возвращают bounded command index и не вызывают provider; `/start` добавляет persona voice greeting перед тем же index. `/persona` возвращает этот index-independent picker с inline keyboard, `/persona <key>` атомарно переключает active persona, отвечает подтверждением и не вызывает provider. Успешный persona callback обновляет picker message через `edit` (отметка активной персоны переезжает) и не создаёт новых сообщений; при недоступном edit отправляется обычное текстовое подтверждение. Unknown/malformed callback или command возвращает безопасную ошибку без state change. Повторный callback выбора уже активной версии является no-op.
+- Destructive команды `/new` и `/forget` не выполняют действие сразу: service создаёт durable one-time confirmation (SQLite `action_confirmation`: random token, owner, action type, canonical JSON payload, sha256 payload hash, created/expires/consumed timestamps) и отвечает inline keyboard `Подтвердить/Отмена`. Callback data содержит только opaque token; confirm и cancel атомарно consume-ят receipt одним conditional `UPDATE` в `BEGIN IMMEDIATE` transaction, поэтому replay, чужой owner, expired receipt (TTL 5 минут) или tampered payload не выполняет действие и не меняет state. Результат confirm/cancel редактирует prompt message на месте через `bound_handle`/`edit` с fallback на новое сообщение.
+- `/memories [page]` показывает header `Память, страница N из M`, inline prev/next кнопки по SQL count и позволяет page callback редактировать list message на месте; pagination является idempotent read-only операцией и не требует receipt. `/forget` без id показывает первую страницу записей с per-record delete buttons, которые открывают тот же confirmation flow.
+- `/remember <text>` создаёт owner-scoped shared memory с kind `fact`; пустой текст и текст длиннее 500 символов отклоняются. `/memories [page]` показывает active memory records текущего пользователя всех scopes по 5 записей на страницу в порядке `updated_at DESC, id DESC` с inline pagination. `/forget [id]` выполняет owner-scoped physical delete только после one-time confirmation. Все эти команды проходят private-only authorization и не вызывают provider.
+- Aiogram adapter может создать response port, связанный с исходным `Message`, либо fixed-owner outbound port для `live-smoke`; Bot API SDK types остаются только в adapter boundary. Typing action и `message is not modified` handling являются adapter-only деталями. Telethon SDK types принадлежат отдельному optional E2E adapter и не входят в production runtime.
 
 ## Memory store и context builder
 
@@ -250,6 +263,41 @@ IncomingTelegramMessage
 - Неизвестный key или неавторизованный caller не меняет `active_persona_key` и не создаёт новую session.
 - Session identity key включает `(conversation_id, persona_key, identity_version)`. При смене persona создаётся отдельная lane; при возврате к прежней версии её session возобновляется.
 - Изменение prompt/version в config не переписывает старую transcript lane молча.
+
+### Phase 2.5 runtime foundation
+
+`Confirmed`: Phase 2.5 runtime foundation additive-мигрирует immutable
+`persona_version` с `persona_id`, `identity_version`, `display_name`,
+`identity_prompt`, voice pack, content hash и timestamps. `persona_session`
+ссылается на конкретную version; migration seed-ит legacy persona rows, поэтому
+старые lanes сохраняют exact identity после restart без смены существующих IDs.
+
+`Confirmed`: voice расширяет каждую config persona без отдельной top-level table:
+
+```toml
+[[personas]]
+key = "lenko"
+display_name = "Lenko"
+identity_prompt = "..."
+identity_version = 4
+
+[personas.voice]
+status = ["..."]
+notice = ["..."]
+command = ["..."]
+error = ["..."]
+```
+
+Voice collections bounded и optional; их renderer использует только allowlisted
+placeholders. Provider output, raw errors и reasoning не могут подставляться в
+эти templates. Транспорт принимает только `system`, `user` и `assistant`.
+
+`Confirmed`: persona versions, на которые ссылается `persona_session`, защищены
+foreign key без `ON DELETE`; удаление такой version завершается constraint error.
+Открытие или миграция базы не выполняет автоматический time-based/orphan reap.
+Явный owner reset удаляет принадлежащие sessions и lanes с их зависимыми
+данными, но не удаляет `persona` или `persona_version`; отдельная cleanup policy
+потребует отдельного решения и regression test.
 
 ## Не входит в MVP
 

@@ -11,6 +11,7 @@ from lenkobot.runtime import (
     login_telegram_e2e,
     main,
     run_application,
+    run_local_chat,
 )
 from lenkobot.telegram_e2e import TelegramE2EReport, TelegramE2EStep
 from lenkobot.telegram_e2e_credentials import TelegramE2ECredentialState
@@ -205,9 +206,14 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     class RecordingMemoryStore:
         paths = []
         closed = 0
+        recovery_users = []
 
         def __init__(self, database_path, **kwargs):
             self.paths.append(database_path)
+
+        def extraction_lane_ids_for_user(self, *, owner_user_id):
+            type(self).recovery_users.append(owner_user_id)
+            return ()
 
         def close(self):
             type(self).closed += 1
@@ -224,10 +230,17 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
 
     observed = {}
 
-    async def polling(bot_token, handler, *, response_port_factory):
+    async def polling(
+        bot_token,
+        handler,
+        *,
+        response_port_factory,
+        command_scope_chat_id,
+    ):
         observed["bot_token"] = bot_token
         observed["handler"] = handler
         observed["response_port_factory"] = response_port_factory
+        observed["command_scope_chat_id"] = command_scope_chat_id
         if polling_error is not None:
             raise polling_error
 
@@ -252,9 +265,11 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     assert RecordingConversationStore.closed == 1
     assert RecordingMemoryStore.closed == 1
     assert RecordingSessionStore.closed == 1
+    assert RecordingMemoryStore.recovery_users == [settings.allowed_user_id]
     assert observed["bot_token"] == "telegram-secret"
     assert isinstance(observed["handler"], TelegramApplicationService)
     assert observed["response_port_factory"] is AiogramTelegramResponsePort
+    assert observed["command_scope_chat_id"] == settings.allowed_user_id
 
 
 def test_main_composes_confirmed_live_smoke_without_oauth(tmp_path, monkeypatch, capsys):
@@ -485,3 +500,173 @@ def test_main_runs_correlated_e2e_bot_with_fresh_external_state(
     assert observed["bot_token"] == "telegram-secret"
     assert observed["response_port_factory"] is AiogramTelegramReplyResponsePort
     assert verified == [("telegram-secret", 777)]
+
+
+def test_chat_prints_only_final_responses_and_closes_application(tmp_path):
+    from lenkobot.telegram_presentation import (
+        TelegramResponse,
+        TelegramResponseKind,
+    )
+
+    settings = load_runtime_settings(write_config(tmp_path))
+    closed = []
+
+    class FakeService:
+        def __init__(self):
+            self.messages = []
+
+        async def handle(self, message, response_port=None):
+            self.messages.append(message)
+            await response_port.send(
+                TelegramResponse(
+                    chat_id=message.chat_id,
+                    kind=TelegramResponseKind.STATUS,
+                    text="status text",
+                )
+            )
+            await response_port.send(
+                TelegramResponse(
+                    chat_id=message.chat_id,
+                    kind=TelegramResponseKind.FINAL,
+                    text="answer text",
+                )
+            )
+
+    class FakeApplication:
+        def __init__(self, service):
+            self.service = service
+
+        def close(self):
+            closed.append(True)
+
+    service = FakeService()
+    output = []
+
+    asyncio.run(
+        run_local_chat(
+            settings,
+            "hello",
+            output=output.append,
+            open_application=lambda current: FakeApplication(service),
+        )
+    )
+
+    assert output == ["answer text"]
+    assert closed == [True]
+    assert [
+        (message.user_id, message.chat_id, message.chat_type, message.text)
+        for message in service.messages
+    ] == [(123456789, 123456789, "private", "hello")]
+
+
+def test_chat_rejects_empty_message_before_opening_application(tmp_path):
+    settings = load_runtime_settings(write_config(tmp_path))
+
+    def open_application(current):
+        raise AssertionError("application must not open")
+
+    with pytest.raises(ValueError, match="message"):
+        asyncio.run(
+            run_local_chat(
+                settings,
+                "   ",
+                output=lambda text: None,
+                open_application=open_application,
+            )
+        )
+
+
+def test_chat_composes_oauth_only_service_and_preserves_conversation_across_invocations(
+    tmp_path,
+    monkeypatch,
+):
+    import lenkobot.runtime as runtime
+    from lenkobot.xai_provider import XaiTextResponse
+
+    class ExistingCredentialStore:
+        target_name = "LenkoBot/xai-oauth/v1/default"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return token_state()
+
+    class FakeMutex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeProvider:
+        supports_message_input = True
+        prompts = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def respond(self, prompt):
+            self.prompts.append(prompt)
+            return XaiTextResponse(
+                response_id="response-1",
+                model="grok-4.5",
+                text="local answer",
+                credential_source="xai_oauth",
+            )
+
+    class FakeStructuredProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def respond(self, prompt, *, schema_name, schema):
+            return SimpleNamespace(value={"candidates": []})
+
+    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
+    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(runtime, "XaiProvider", FakeProvider)
+    monkeypatch.setattr(runtime, "XaiStructuredProvider", FakeStructuredProvider)
+    config_path = write_config(tmp_path)
+    data_root = tmp_path / "chat-state"
+    settings = load_runtime_settings(config_path, data_root=data_root)
+    output = []
+
+    asyncio.run(run_local_chat(settings, "hello", output=output.append))
+    asyncio.run(run_local_chat(settings, "again", output=output.append))
+
+    assert output == ["local answer", "local answer"]
+    assert (data_root / "state.db").is_file()
+    first_prompt, second_prompt = FakeProvider.prompts
+    assert first_prompt[0].role == "system"
+    assert [message.role for message in first_prompt] == ["system", "user"]
+    second_roles = [message.role for message in second_prompt]
+    assert second_roles[0] == "system"
+    assert second_roles.count("user") >= 2
+    assert "assistant" in second_roles
+
+
+def test_main_runs_chat_with_explicit_data_root(tmp_path, monkeypatch):
+    import lenkobot.runtime as runtime
+
+    config_path = write_config(tmp_path / "config")
+    data_root = tmp_path / "chat-state"
+    observed = {}
+
+    async def chat(settings, message, **kwargs):
+        observed["settings"] = settings
+        observed["message"] = message
+
+    monkeypatch.setattr(runtime, "run_local_chat", chat)
+
+    result = main(
+        [
+            "chat",
+            "--config",
+            str(config_path),
+            "--data-root",
+            str(data_root),
+            "--message",
+            "hello",
+        ]
+    )
+
+    assert result == 0
+    assert observed["settings"].data_root == data_root
+    assert observed["message"] == "hello"

@@ -13,11 +13,12 @@ from .aiogram_adapter import (
     run_polling,
     verify_bot_identity,
 )
+from .action_confirmation import SQLiteActionConfirmationStore
 from .application_service import TelegramApplicationService
 from .context_builder import ContextBuilder
 from .live_smoke import run_live_smoke
 from .memory import SQLiteMemoryStore
-from .memory_extraction import MemoryExtractionService
+from .memory_extraction import ExtractionCoordinator, MemoryExtractionService
 from .oauth_credentials import (
     WindowsOAuthCredentialStore,
     WindowsOAuthRefreshMutex,
@@ -37,7 +38,13 @@ from .telegram_e2e_credentials import (
     TelegramE2ECredentialState,
     WindowsTelegramE2ECredentialStore,
 )
-from .telegram_router import RoutedTurn, SQLiteConversationStore, TelegramRouter
+from .telegram_presentation import TelegramResponseKind
+from .telegram_router import (
+    IncomingTelegramMessage,
+    RoutedTurn,
+    SQLiteConversationStore,
+    TelegramRouter,
+)
 from .xai_provider import (
     CredentialPolicy,
     CredentialUnavailable,
@@ -63,6 +70,7 @@ class RuntimeSettings:
     oauth_client_id: str
     persona_catalog: PersonaCatalog
     export_recipient: str | None = None
+    config_path: Path | None = None
 
 
 class _DiscardingReplyPort:
@@ -126,6 +134,7 @@ def load_runtime_settings(
         oauth_client_id=client_id,
         persona_catalog=persona_catalog,
         export_recipient=export_recipient,
+        config_path=path,
     )
 
 
@@ -187,16 +196,22 @@ def login_telegram_e2e(
     output(f"Telegram E2E login completed for test user ID {state.user_id}.")
 
 
-async def run_application(
-    settings: RuntimeSettings,
-    bot_token: str,
-    *,
-    polling: Callable[..., Awaitable[None]] = run_polling,
-    response_port_factory: Callable[..., object] = AiogramTelegramResponsePort,
-) -> None:
-    if not isinstance(bot_token, str) or not bot_token.strip():
-        raise ValueError("Telegram bot token cannot be empty")
+@dataclass(slots=True)
+class LocalApplication:
+    service: TelegramApplicationService
+    _conversation_store: SQLiteConversationStore
+    _memory_store: SQLiteMemoryStore
+    _session_store: SQLiteSessionStore
+    _confirmation_store: SQLiteActionConfirmationStore
 
+    def close(self) -> None:
+        self._conversation_store.close()
+        self._memory_store.close()
+        self._session_store.close()
+        self._confirmation_store.close()
+
+
+def open_local_application(settings: RuntimeSettings) -> LocalApplication:
     store = WindowsOAuthCredentialStore()
     if store.load() is None:
         raise CredentialUnavailable("OAuth credential state is unavailable")
@@ -235,11 +250,23 @@ async def run_application(
         conversation_store.close()
         memory_store.close()
         raise
+    try:
+        confirmation_store = SQLiteActionConfirmationStore(database_path)
+    except Exception:
+        conversation_store.close()
+        memory_store.close()
+        session_store.close()
+        raise
     extraction_service = MemoryExtractionService(
         memory_store,
         session_store,
         structured_provider,
     )
+    extraction_coordinator = ExtractionCoordinator(
+        memory_store,
+        extraction_service,
+    )
+    extraction_coordinator.recover_for_user(owner_user_id=settings.allowed_user_id)
     session_finalizer = SQLiteSessionFinalizer(
         database_path,
         XaiSummaryGenerator(structured_provider),
@@ -264,18 +291,80 @@ async def run_application(
         memory_store=memory_store,
         session_store=session_store,
         extraction_service=extraction_service,
+        extraction_coordinator=extraction_coordinator,
         session_finalizer=session_finalizer,
+        persona_config_path=settings.config_path,
+        confirmation_store=confirmation_store,
     )
+    return LocalApplication(
+        service,
+        conversation_store,
+        memory_store,
+        session_store,
+        confirmation_store,
+    )
+
+
+async def run_application(
+    settings: RuntimeSettings,
+    bot_token: str,
+    *,
+    polling: Callable[..., Awaitable[None]] = run_polling,
+    response_port_factory: Callable[..., object] = AiogramTelegramResponsePort,
+) -> None:
+    if not isinstance(bot_token, str) or not bot_token.strip():
+        raise ValueError("Telegram bot token cannot be empty")
+
+    application = open_local_application(settings)
     try:
         await polling(
             bot_token,
-            service,
+            application.service,
             response_port_factory=response_port_factory,
+            command_scope_chat_id=settings.allowed_user_id,
         )
     finally:
-        conversation_store.close()
-        memory_store.close()
-        session_store.close()
+        application.close()
+
+
+async def run_local_chat(
+    settings: RuntimeSettings,
+    message: str,
+    *,
+    output: Callable[[str], None] = print,
+    open_application: Callable[[RuntimeSettings], LocalApplication] = open_local_application,
+) -> None:
+    if not message.strip():
+        raise ValueError("chat message cannot be empty")
+
+    application = open_application(settings)
+    responses = []
+
+    class _Collector:
+        async def send(self, response) -> None:
+            responses.append(response)
+
+    try:
+        await application.service.handle(
+            IncomingTelegramMessage(
+                user_id=settings.allowed_user_id,
+                chat_id=settings.allowed_user_id,
+                chat_type="private",
+                text=message,
+            ),
+            _Collector(),
+        )
+    finally:
+        application.close()
+
+    finals = [
+        response for response in responses
+        if response.kind is TelegramResponseKind.FINAL
+    ]
+    for response in finals:
+        output(response.text)
+    if not finals and responses:
+        output(responses[-1].text)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -286,6 +375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for command in (
         "login",
         "run",
+        "chat",
         "live-smoke",
         "telegram-e2e",
         "telegram-e2e-bot",
@@ -294,6 +384,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command_parser.add_argument("--config", required=True, type=Path)
         if command == "run":
             command_parser.add_argument("--data-root", type=Path)
+        elif command == "chat":
+            command_parser.add_argument("--data-root", required=True, type=Path)
+            command_parser.add_argument("--message", required=True)
         elif command == "live-smoke":
             command_parser.add_argument("--data-root", required=True, type=Path)
             command_parser.add_argument("--confirm-send", action="store_true")
@@ -373,6 +466,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "run":
             bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             asyncio.run(run_application(settings, bot_token))
+        elif arguments.command == "chat":
+            asyncio.run(run_local_chat(settings, arguments.message))
         elif arguments.command == "live-smoke":
             bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             report = asyncio.run(

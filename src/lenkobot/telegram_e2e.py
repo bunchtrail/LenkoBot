@@ -8,19 +8,10 @@ from uuid import uuid4
 
 from .personas import PersonaCatalog
 from .telegram_e2e_credentials import TelegramE2ECredentialState
+from .telegram_presentation import render_command_index
 
 
 _BOT_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{5,32}$")
-_COMMAND_HELP = (
-    "Доступные команды:\n"
-    "/start, /help — показать эту справку.\n"
-    "/persona [key] — выбрать персону.\n"
-    "/remember <text> — сохранить общую запись.\n"
-    "/memories [page] — показать записи памяти.\n"
-    "/forget <id> — удалить запись памяти."
-)
-
-
 class TelegramE2EError(RuntimeError):
     pass
 
@@ -56,6 +47,13 @@ class TelegramE2EReport:
 
 class TelegramE2ETransport(Protocol):
     async def exchange(self, command: str) -> TelegramE2EMessage: ...
+
+    async def click_button(
+        self,
+        message_id: int,
+        *,
+        button_text: str,
+    ) -> TelegramE2EMessage: ...
 
     async def close(self) -> None: ...
 
@@ -171,21 +169,30 @@ async def _run_scenario(
 ) -> TelegramE2EReport:
     steps = []
     last_message_id = 0
-    help_predicate = lambda text: text == _COMMAND_HELP
-    persona_text = "Доступные персоны: " + ", ".join(
-        f"{key} ({display_name})"
-        for key, display_name in settings.persona_display_names
-    ) + "."
 
-    for command in ("/start", "/help"):
-        message = await _checked_exchange(
-            transport,
-            command,
-            last_message_id=last_message_id,
-            expected=help_predicate,
-        )
-        last_message_id = message.id
-        steps.append(TelegramE2EStep(command=command, response_text=_COMMAND_HELP))
+    index_text = render_command_index()
+
+    message = await _checked_exchange(
+        transport,
+        "/start",
+        last_message_id=last_message_id,
+        expected=lambda text: text.endswith(index_text) and text != index_text,
+    )
+    last_message_id = message.id
+    steps.append(TelegramE2EStep(command="/start", response_text=message.text))
+
+    message = await _checked_exchange(
+        transport,
+        "/help",
+        last_message_id=last_message_id,
+        expected=lambda text: text == index_text,
+    )
+    last_message_id = message.id
+    steps.append(TelegramE2EStep(command="/help", response_text=index_text))
+
+    persona_text = "Выбери персону: " + ", ".join(
+        display_name for _, display_name in settings.persona_display_names
+    ) + "."
 
     message = await _checked_exchange(
         transport,
@@ -217,7 +224,8 @@ async def _run_scenario(
     memory_lines = message.text.splitlines()
     memory_match = (
         None
-        if len(memory_lines) != 2 or memory_lines[0] != "Память, страница 1:"
+        if len(memory_lines) != 2
+        or re.fullmatch(r"Память, страница 1 из \d+:", memory_lines[0]) is None
         else re.fullmatch(
             rf"(\d+)\. \[shared\] {re.escape(probe)}",
             memory_lines[1],
@@ -226,15 +234,22 @@ async def _run_scenario(
     if memory_match is None:
         raise TelegramE2EError("Telegram E2E memory reply is invalid")
     memory_id = int(memory_match.group(1))
-    normalized_memories = "Память, страница 1:\n<id>. [shared] <probe>"
+    normalized_memories = f"{memory_lines[0]}\n<id>. [shared] <probe>"
     steps.append(
         TelegramE2EStep(command="/memories", response_text=normalized_memories)
     )
 
-    message = await _checked_exchange(
+    prompt = await _checked_exchange(
         transport,
         f"/forget {memory_id}",
         last_message_id=last_message_id,
+        expected=lambda text: text.startswith(f"Удалить запись {memory_id}: «")
+        and probe in text,
+    )
+    await _checked_click(
+        transport,
+        prompt,
+        button_text="Удалить",
         expected=lambda text: text == f"Удалено: запись {memory_id}.",
     )
     steps.append(
@@ -244,6 +259,29 @@ async def _run_scenario(
         )
     )
     return TelegramE2EReport(steps=tuple(steps))
+
+
+async def _checked_click(
+    transport: TelegramE2ETransport,
+    prompt: TelegramE2EMessage,
+    *,
+    button_text: str,
+    expected: Callable[[str], bool],
+) -> TelegramE2EMessage:
+    try:
+        message = await transport.click_button(prompt.id, button_text=button_text)
+    except TelegramE2EError:
+        raise
+    except Exception:
+        raise TelegramE2EError("Telegram E2E button click failed") from None
+    if (
+        not isinstance(message, TelegramE2EMessage)
+        or message.id != prompt.id
+        or not isinstance(message.text, str)
+        or not expected(message.text)
+    ):
+        raise TelegramE2EError("Telegram E2E received an unexpected confirmation")
+    return message
 
 
 async def _checked_exchange(

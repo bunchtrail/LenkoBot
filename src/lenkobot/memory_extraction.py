@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 import json
 import re
+from threading import RLock
 from typing import Protocol
 
 from .memory import (
     MemoryCategory,
     MemoryExtractionRun,
+    ExtractionRunStatus,
     MemoryRecord,
     MemorySource,
     MemoryScope,
@@ -316,6 +318,113 @@ class MemoryExtractionService:
                 )
             )
         return tuple(records)
+
+
+class ExtractionCoordinator:
+    def __init__(
+        self,
+        memory_store: SQLiteMemoryStore,
+        extraction_service: MemoryExtractionService,
+        *,
+        max_attempts: int = 3,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        self._memory_store = memory_store
+        self._extraction_service = extraction_service
+        self._max_attempts = max_attempts
+        self._lock = RLock()
+
+    def drain_for_lane(
+        self,
+        *,
+        owner_user_id: int,
+        persona_session_id: int,
+    ) -> None:
+        with self._lock:
+            runs = self._memory_store.list_extraction_runs_for_lane(
+                owner_user_id=owner_user_id,
+                persona_session_id=persona_session_id,
+            )
+            for run in runs:
+                status = run.status
+                if status is ExtractionRunStatus.PROCESSING:
+                    self._memory_store.recover_extraction_run(
+                        run.id,
+                        owner_user_id=owner_user_id,
+                    )
+                    status = ExtractionRunStatus.PENDING
+                if status is ExtractionRunStatus.FAILED:
+                    if run.attempt >= self._max_attempts:
+                        continue
+                    self._memory_store.retry_extraction_run(
+                        run.id,
+                        owner_user_id=owner_user_id,
+                        max_attempts=self._max_attempts,
+                    )
+                    status = ExtractionRunStatus.PENDING
+                if status is ExtractionRunStatus.PENDING:
+                    self._extraction_service.process_with_retry(
+                        run.id,
+                        owner_user_id=owner_user_id,
+                        max_attempts=self._max_attempts,
+                    )
+
+    def process_after_delivery(
+        self,
+        *,
+        run_id: int,
+        owner_user_id: int,
+        persona_session_id: int,
+    ) -> None:
+        with self._lock:
+            run = self._memory_store.get_extraction_run(
+                run_id,
+                owner_user_id=owner_user_id,
+            )
+            if run is None or run.session_id != persona_session_id:
+                raise ValueError("extraction run is not owned by the active lane")
+            if run.status is ExtractionRunStatus.PROCESSING:
+                self._memory_store.recover_extraction_run(
+                    run.id,
+                    owner_user_id=owner_user_id,
+                )
+                run = self._memory_store.get_extraction_run(
+                    run.id,
+                    owner_user_id=owner_user_id,
+                )
+            if run is None:
+                raise ValueError("extraction run disappeared")
+            if run.status in {
+                ExtractionRunStatus.COMPLETED,
+                ExtractionRunStatus.DISCARDED,
+            }:
+                return
+            if run.status is ExtractionRunStatus.FAILED:
+                if run.attempt >= self._max_attempts:
+                    raise RuntimeError("extraction retry budget is exhausted")
+                self._memory_store.retry_extraction_run(
+                    run.id,
+                    owner_user_id=owner_user_id,
+                    max_attempts=self._max_attempts,
+                )
+            self._extraction_service.process_with_retry(
+                run.id,
+                owner_user_id=owner_user_id,
+                max_attempts=self._max_attempts,
+            )
+
+    def recover_for_user(self, *, owner_user_id: int) -> None:
+        for persona_session_id in self._memory_store.extraction_lane_ids_for_user(
+            owner_user_id=owner_user_id,
+        ):
+            try:
+                self.drain_for_lane(
+                    owner_user_id=owner_user_id,
+                    persona_session_id=persona_session_id,
+                )
+            except Exception:
+                pass
 
 
 def parse_memory_candidate_response(payload: object) -> tuple[MemoryCandidate, ...]:

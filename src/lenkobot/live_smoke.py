@@ -5,6 +5,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .aiogram_adapter import run_bot_delivery
+from .action_confirmation import SQLiteActionConfirmationStore
 from .application_service import TelegramApplicationService
 from .memory import SQLiteMemoryStore
 from .personas import PersonaCatalog
@@ -12,8 +13,11 @@ from .telegram_presentation import (
     TelegramResponse,
     TelegramResponseKind,
     TelegramResponsePort,
+    confirmation_callback_data,
+    parse_confirmation_callback_data,
 )
 from .telegram_router import (
+    IncomingTelegramCallback,
     IncomingTelegramMessage,
     RoutedTurn,
     SQLiteConversationStore,
@@ -73,7 +77,7 @@ async def run_live_smoke(
 
     data_root = _validate_data_root(settings.data_root, config_path=config_path)
     probe_text = _probe_text(marker)
-    service, memory_store, conversation_store = _open_scenario(
+    service, memory_store, conversation_store, confirmation_store = _open_scenario(
         data_root=data_root,
         allowed_user_id=settings.allowed_user_id,
         persona_catalog=settings.persona_catalog,
@@ -94,6 +98,7 @@ async def run_live_smoke(
     finally:
         memory_store.close()
         conversation_store.close()
+        confirmation_store.close()
 
 
 def _validate_data_root(data_root: Path | str, *, config_path: Path | str) -> Path:
@@ -128,6 +133,7 @@ def _open_scenario(
     TelegramApplicationService,
     SQLiteMemoryStore,
     SQLiteConversationStore,
+    SQLiteActionConfirmationStore,
 ]:
     data_root.mkdir()
     if data_root.resolve(strict=True) != data_root:
@@ -138,6 +144,12 @@ def _open_scenario(
         memory_store = SQLiteMemoryStore(database_path)
     except Exception:
         conversation_store.close()
+        raise
+    try:
+        confirmation_store = SQLiteActionConfirmationStore(database_path)
+    except Exception:
+        conversation_store.close()
+        memory_store.close()
         raise
 
     router = TelegramRouter(
@@ -151,8 +163,9 @@ def _open_scenario(
         persona_catalog,
         _ForbiddenProvider(),
         memory_store=memory_store,
+        confirmation_store=confirmation_store,
     )
-    return service, memory_store, conversation_store
+    return service, memory_store, conversation_store, confirmation_store
 
 
 async def _run_scenario(
@@ -164,14 +177,15 @@ async def _run_scenario(
     response_port: TelegramResponsePort,
     probe_text: str,
 ) -> LiveSmokeReport:
-    help_text = (
-        lambda text: "/remember <text>" in text
-        and "/memories [page]" in text
-        and "/forget <id>" in text
-    )
-    persona_text = "Доступные персоны: " + ", ".join(
-        f"{persona.key} ({persona.display_name})"
-        for persona in persona_catalog.personas
+    def help_text(text: str) -> bool:
+        return (
+            "/remember <text>" in text
+            and "/memories [page]" in text
+            and "/forget [id]" in text
+        )
+
+    persona_text = "Выбери персону: " + ", ".join(
+        persona.display_name for persona in persona_catalog.personas
     ) + "."
 
     await _run_command(
@@ -222,10 +236,18 @@ async def _run_scenario(
         response_port,
         lambda text: f"{memory_id}. [shared] {probe_text}" in text,
     )
-    await _run_command(
+    prompt = await _run_command(
         service,
         allowed_user_id,
         f"/forget {memory_id}",
+        response_port,
+        lambda text: text == f"Удалить запись {memory_id}: «{probe_text}»?",
+    )
+    token = _extract_confirmation_token(prompt)
+    await _run_callback(
+        service,
+        allowed_user_id,
+        confirmation_callback_data("confirm", token),
         response_port,
         lambda text: text == f"Удалено: запись {memory_id}.",
     )
@@ -234,13 +256,46 @@ async def _run_scenario(
     return LiveSmokeReport(commands=_COMMANDS)
 
 
+def _extract_confirmation_token(response: TelegramResponse) -> str:
+    for row in response.inline_keyboard:
+        for button in row:
+            parsed = parse_confirmation_callback_data(button.callback_data)
+            if parsed is not None and parsed[0] == "confirm":
+                return parsed[1]
+    raise LiveSmokeError("live smoke confirmation prompt has no confirm button")
+
+
+async def _run_callback(
+    service: TelegramApplicationService,
+    allowed_user_id: int,
+    callback_data: str,
+    response_port: TelegramResponsePort,
+    expected_text: Callable[[str], bool],
+) -> TelegramResponse:
+    validating_port = _ValidatingResponsePort(
+        response_port,
+        target_chat_id=allowed_user_id,
+        expected_text=expected_text,
+    )
+    await service.handle_callback(
+        IncomingTelegramCallback(
+            user_id=allowed_user_id,
+            chat_id=allowed_user_id,
+            chat_type="private",
+            data=callback_data,
+        ),
+        validating_port,
+    )
+    return validating_port.require_response()
+
+
 async def _run_command(
     service: TelegramApplicationService,
     allowed_user_id: int,
     command: str,
     response_port: TelegramResponsePort,
     expected_text: Callable[[str], bool],
-) -> None:
+) -> TelegramResponse:
     validating_port = _ValidatingResponsePort(
         response_port,
         target_chat_id=allowed_user_id,
@@ -255,7 +310,7 @@ async def _run_command(
         ),
         validating_port,
     )
-    validating_port.require_response()
+    return validating_port.require_response()
 
 
 class _ValidatingResponsePort:
@@ -283,9 +338,10 @@ class _ValidatingResponsePort:
         self._response = response
         await self._response_port.send(response)
 
-    def require_response(self) -> None:
+    def require_response(self) -> TelegramResponse:
         if self._response is None:
             raise LiveSmokeError("live smoke command produced no response")
+        return self._response
 
 
 class _ForbiddenProvider:

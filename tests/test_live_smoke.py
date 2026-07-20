@@ -72,13 +72,18 @@ def test_live_smoke_runs_owner_commands_in_fresh_state_and_deletes_probe(tmp_pat
     assert report.command_count == 6
     assert [response.kind for response in response_port.responses] == [
         TelegramResponseKind.FINAL
-    ] * 6
+    ] * 7
     assert all(response.chat_id == 123456789 for response in response_port.responses)
     assert "/remember <text>" in response_port.responses[0].text
-    assert "Доступные персоны: lenko (Lenko)." == response_port.responses[2].text
+    assert "Выбери персону: Lenko." == response_port.responses[2].text
+    assert response_port.responses[2].inline_keyboard[0][0].text == "✓ Lenko"
     assert response_port.responses[3].text == "Запомнил: LenkoBot smoke run-123."
     assert "[shared] LenkoBot smoke run-123" in response_port.responses[4].text
-    assert response_port.responses[5].text == "Удалено: запись 1."
+    assert response_port.responses[5].text == (
+        "Удалить запись 1: «LenkoBot smoke run-123»?"
+    )
+    assert response_port.responses[5].inline_keyboard[0][0].text == "Удалить"
+    assert response_port.responses[6].text == "Удалено: запись 1."
 
     memory_store = SQLiteMemoryStore(data_root / "state.db")
     try:

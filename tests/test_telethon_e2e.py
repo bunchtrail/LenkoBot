@@ -5,6 +5,7 @@ import pytest
 
 from lenkobot.telegram_e2e import (
     TelegramE2EError,
+    TelegramE2EMessage,
     TelegramE2ESettings,
 )
 from lenkobot.telegram_e2e_credentials import TelegramE2ECredentialState
@@ -243,6 +244,54 @@ def test_telethon_transport_rejects_concurrent_outgoing_activity():
     asyncio.run(transport.close())
 
 
+def test_telethon_transport_clicks_button_and_returns_edited_message():
+    client = RuntimeClient()
+    bindings = TelethonBindings(
+        client_factory=lambda session, api_id, api_hash: client,
+        string_session_factory=FakeStringSession,
+        new_message_factory=lambda **kwargs: kwargs,
+        password_needed_error=PasswordNeededError,
+    )
+    transport = asyncio.run(
+        open_telethon_transport(
+            settings(),
+            credential_state(),
+            bindings=bindings,
+            timeout_seconds=0.1,
+            quiet_seconds=0,
+        )
+    )
+
+    result = asyncio.run(transport.click_button(50, button_text="Удалить"))
+    asyncio.run(transport.close())
+
+    assert result == TelegramE2EMessage(id=50, text="Удалено: запись 7.")
+    assert client.prompt.clicks == ["Удалить"]
+
+
+def test_telethon_transport_times_out_when_confirmation_edit_never_arrives():
+    client = RuntimeClient(edit_prompt_on_click=False)
+    bindings = TelethonBindings(
+        client_factory=lambda session, api_id, api_hash: client,
+        string_session_factory=FakeStringSession,
+        new_message_factory=lambda **kwargs: kwargs,
+        password_needed_error=PasswordNeededError,
+    )
+    transport = asyncio.run(
+        open_telethon_transport(
+            settings(),
+            credential_state(),
+            bindings=bindings,
+            timeout_seconds=0.01,
+            quiet_seconds=0,
+        )
+    )
+
+    with pytest.raises(TelegramE2EError):
+        asyncio.run(transport.click_button(50, button_text="Удалить"))
+    asyncio.run(transport.close())
+
+
 class AuthorizationClient:
     def __init__(self, *, require_password):
         self.require_password = require_password
@@ -279,6 +328,7 @@ class RuntimeClient:
         reply_to_message_id=11,
         stale_event_on_second_lookup=False,
         concurrent_outgoing_message=False,
+        edit_prompt_on_click=True,
     ):
         self.me = SimpleNamespace(id=555, bot=False)
         self.bot = SimpleNamespace(
@@ -296,6 +346,18 @@ class RuntimeClient:
         self.event_filters = []
         self.sent = []
         self.disconnected = False
+        self.prompt = SimpleNamespace(
+            id=50,
+            raw_text="Удалить запись 7: «probe»?",
+            clicks=[],
+        )
+
+        async def click(text=None):
+            self.prompt.clicks.append(text)
+            if edit_prompt_on_click:
+                self.prompt.raw_text = "Удалено: запись 7."
+
+        self.prompt.click = click
 
     async def connect(self):
         return None
@@ -309,7 +371,9 @@ class RuntimeClient:
     async def get_entity(self, username):
         return self.bot
 
-    async def get_messages(self, entity, *, limit):
+    async def get_messages(self, entity, *, limit=None, ids=None):
+        if ids is not None:
+            return self.prompt
         self.message_lookups += 1
         if self.stale_event_on_second_lookup and self.message_lookups == 2:
             event = SimpleNamespace(

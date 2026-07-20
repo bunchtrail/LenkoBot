@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .persona_store import ensure_persona_version, persona_version_from_row
 from .personas import Persona, PersonaCatalog
 from .sqlite_schema import open_state_database
 
@@ -11,6 +12,14 @@ class IncomingTelegramMessage:
     user_id: int
     chat_id: int
     text: str
+    chat_type: str | None = None
+
+
+@dataclass(frozen=True)
+class IncomingTelegramCallback:
+    user_id: int
+    chat_id: int
+    data: str
     chat_type: str | None = None
 
 
@@ -55,6 +64,10 @@ class SQLiteConversationStore:
                 raise ValueError("active persona is not present in catalog")
             try:
                 with self._connection:
+                    _, persona_version_id = ensure_persona_version(
+                        self._connection,
+                        persona,
+                    )
                     updated = self._connection.execute(
                         """
                         UPDATE conversation
@@ -68,19 +81,45 @@ class SQLiteConversationStore:
                     self._connection.execute(
                         """
                         INSERT OR IGNORE INTO persona_session
-                            (conversation_id, persona_key, identity_version)
-                        VALUES (?, ?, ?)
+                            (conversation_id, persona_key, identity_version,
+                                persona_version_id)
+                        VALUES (?, ?, ?, ?)
                         """,
-                        (conversation_id, persona_key, persona.identity_version),
+                        (
+                            conversation_id,
+                            persona_key,
+                            persona.identity_version,
+                            persona_version_id,
+                        ),
+                    )
+                    self._connection.execute(
+                        """
+                        UPDATE persona_session
+                        SET persona_version_id = ?
+                        WHERE conversation_id = ? AND persona_key = ?
+                            AND identity_version = ?
+                            AND persona_version_id IS NULL
+                        """,
+                        (
+                            persona_version_id,
+                            conversation_id,
+                            persona_key,
+                            persona.identity_version,
+                        ),
                     )
                     session = self._connection.execute(
                         """
                         SELECT id
                         FROM persona_session
                         WHERE conversation_id = ? AND persona_key = ?
-                            AND identity_version = ?
+                            AND identity_version = ? AND persona_version_id = ?
                         """,
-                        (conversation_id, persona_key, persona.identity_version),
+                        (
+                            conversation_id,
+                            persona_key,
+                            persona.identity_version,
+                            persona_version_id,
+                        ),
                     ).fetchone()
             except _ConversationVersionConflict:
                 continue
@@ -143,6 +182,10 @@ class SQLiteConversationStore:
             version = int(conversation["version"])
             try:
                 with self._connection:
+                    _, persona_version_id = ensure_persona_version(
+                        self._connection,
+                        persona,
+                    )
                     updated = self._connection.execute(
                         """
                         UPDATE conversation
@@ -156,10 +199,31 @@ class SQLiteConversationStore:
                     self._connection.execute(
                         """
                         INSERT OR IGNORE INTO persona_session
-                            (conversation_id, persona_key, identity_version)
-                        VALUES (?, ?, ?)
+                            (conversation_id, persona_key, identity_version,
+                                persona_version_id)
+                        VALUES (?, ?, ?, ?)
                         """,
-                        (conversation_id, persona.key, persona.identity_version),
+                        (
+                            conversation_id,
+                            persona.key,
+                            persona.identity_version,
+                            persona_version_id,
+                        ),
+                    )
+                    self._connection.execute(
+                        """
+                        UPDATE persona_session
+                        SET persona_version_id = ?
+                        WHERE conversation_id = ? AND persona_key = ?
+                            AND identity_version = ?
+                            AND persona_version_id IS NULL
+                        """,
+                        (
+                            persona_version_id,
+                            conversation_id,
+                            persona.key,
+                            persona.identity_version,
+                        ),
                     )
             except _ConversationVersionConflict:
                 continue
@@ -181,6 +245,45 @@ class SQLiteConversationStore:
 
     def persona_session_count(self) -> int:
         return self._connection.execute("SELECT COUNT(*) FROM persona_session").fetchone()[0]
+
+    def persist_persona_catalog(self, persona_catalog: PersonaCatalog) -> None:
+        with self._connection:
+            for persona in persona_catalog.personas:
+                ensure_persona_version(self._connection, persona)
+
+    def persona_version_for_lane(self, session_id: int):
+        row = self._connection.execute(
+            """
+            SELECT version.id, version.persona_id, persona.key,
+                version.display_name, version.identity_prompt,
+                version.identity_version, version.voice_json,
+                version.content_hash, version.created_at
+            FROM persona_session AS lane
+            JOIN persona_version AS version
+                ON version.id = lane.persona_version_id
+            JOIN persona ON persona.id = version.persona_id
+            WHERE lane.id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            row = self._connection.execute(
+                """
+                SELECT version.id, version.persona_id, persona.key,
+                    version.display_name, version.identity_prompt,
+                    version.identity_version, version.voice_json,
+                    version.content_hash, version.created_at
+                FROM persona_session AS lane
+                JOIN persona ON persona.key = lane.persona_key
+                    AND persona.profile_id = 'default'
+                JOIN persona_version AS version
+                    ON version.persona_id = persona.id
+                    AND version.identity_version = lane.identity_version
+                WHERE lane.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return None if row is None else persona_version_from_row(row)
 
     def close(self) -> None:
         self._connection.close()
@@ -206,11 +309,39 @@ class TelegramRouter:
     def is_authorized(self, user_id: int, chat_type: str | None) -> bool:
         return user_id == self._allowed_user_id and chat_type == "private"
 
+    @property
+    def allowed_user_id(self) -> int:
+        return self._allowed_user_id
+
     def route(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
         if not self.is_authorized(message.user_id, message.chat_type):
             return None
 
         return self._store.route_message(message, self._persona_catalog)
+
+    def replace_catalog(self, persona_catalog: PersonaCatalog) -> None:
+        for current in self._persona_catalog.personas:
+            replacement = persona_catalog.get(current.key)
+            if replacement is None:
+                continue
+            if replacement.identity_version < current.identity_version or (
+                replacement.identity_version == current.identity_version
+                and replacement != current
+            ):
+                raise ValueError(
+                    "persona reload requires a higher identity_version"
+                )
+        self._store.persist_persona_catalog(persona_catalog)
+        self._persona_catalog = persona_catalog
+
+    def persona_for_turn(self, turn: RoutedTurn) -> Persona:
+        version = self._store.persona_version_for_lane(turn.session_id)
+        if version is not None:
+            return version.as_persona()
+        persona = self._persona_catalog.get(turn.persona_key)
+        if persona is None or persona.identity_version != turn.identity_version:
+            raise ValueError("routed persona version is not available")
+        return persona
 
     def current_lane(self, message: IncomingTelegramMessage) -> RoutedTurn | None:
         if not self.is_authorized(message.user_id, message.chat_type):

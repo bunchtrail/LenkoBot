@@ -47,9 +47,11 @@ def credential_state(*, user_id=555):
 
 
 class ScriptedTransport:
-    def __init__(self, response_for):
+    def __init__(self, response_for, click_response_for=None):
         self._response_for = response_for
+        self._click_response_for = click_response_for
         self.commands = []
+        self.clicks = []
         self.closed = False
 
     async def exchange(self, command):
@@ -59,8 +61,27 @@ class ScriptedTransport:
             text=self._response_for(command),
         )
 
+    async def click_button(self, message_id, *, button_text):
+        self.clicks.append((message_id, button_text))
+        return TelegramE2EMessage(
+            id=message_id,
+            text=self._click_response_for(message_id, button_text),
+        )
+
     async def close(self):
         self.closed = True
+
+
+_COMMAND_INDEX = (
+    "Доступные команды:\n"
+    "/start — открыть управление.\n"
+    "/help — показать команды.\n"
+    "/persona — выбрать персону.\n"
+    "/new — закрыть текущий разговор.\n"
+    "/remember <text> — сохранить общую запись.\n"
+    "/memories [page] — показать записи памяти.\n"
+    "/forget [id] — удалить запись памяти."
+)
 
 
 def successful_response_script():
@@ -68,32 +89,32 @@ def successful_response_script():
 
     def response(command):
         nonlocal probe
-        if command in {"/start", "/help"}:
-            return (
-                "Доступные команды:\n"
-                "/start, /help — показать эту справку.\n"
-                "/persona [key] — выбрать персону.\n"
-                "/remember <text> — сохранить общую запись.\n"
-                "/memories [page] — показать записи памяти.\n"
-                "/forget <id> — удалить запись памяти."
-            )
+        if command == "/start":
+            return "На связи. Вот что умею:\n" + _COMMAND_INDEX
+        if command == "/help":
+            return _COMMAND_INDEX
         if command == "/persona":
-            return "Доступные персоны: lenko (Lenko)."
+            return "Выбери персону: Lenko."
         if command.startswith("/remember "):
             probe = command.removeprefix("/remember ")
             return f"Запомнил: {probe}."
         if command == "/memories":
-            return f"Память, страница 1:\n7. [shared] {probe}"
+            return f"Память, страница 1 из 1:\n7. [shared] {probe}"
         if command == "/forget 7":
-            return "Удалено: запись 7."
+            return f"Удалить запись 7: «{probe}»?"
         raise AssertionError(f"unexpected command: {command}")
 
-    return response
+    def click_response(message_id, button_text):
+        assert button_text == "Удалить"
+        return "Удалено: запись 7."
+
+    return response, click_response
 
 
 def test_telegram_e2e_receives_and_checks_real_command_reply_sequence(tmp_path):
     settings = load_telegram_e2e_settings(write_config(tmp_path))
-    transport = ScriptedTransport(successful_response_script())
+    response_script, click_script = successful_response_script()
+    transport = ScriptedTransport(response_script, click_script)
     factory_calls = []
 
     async def transport_factory(observed_settings, credentials):
@@ -119,6 +140,7 @@ def test_telegram_e2e_receives_and_checks_real_command_reply_sequence(tmp_path):
         "/memories",
         "/forget 7",
     ]
+    assert transport.clicks == [(106, "Удалить")]
     assert transport.closed is True
     assert report.command_count == 6
     assert [step.command for step in report.steps] == [
@@ -129,6 +151,7 @@ def test_telegram_e2e_receives_and_checks_real_command_reply_sequence(tmp_path):
         "/memories",
         "/forget",
     ]
+    assert report.steps[0].response_text.startswith("На связи. Вот что умею:")
     assert report.steps[3].response_text == "Запомнил: <probe>."
     assert "<id>. [shared] <probe>" in report.steps[4].response_text
     assert report.steps[5].response_text == "Удалено: запись <id>."
@@ -180,7 +203,7 @@ def test_telegram_e2e_stops_on_unexpected_reply_and_closes_transport(tmp_path):
 
 def test_telegram_e2e_rejects_help_reply_with_appended_private_text(tmp_path):
     settings = load_telegram_e2e_settings(write_config(tmp_path))
-    base_response = successful_response_script()
+    base_response, _ = successful_response_script()
 
     def response(command):
         result = base_response(command)
@@ -209,7 +232,7 @@ def test_telegram_e2e_rejects_help_reply_with_appended_private_text(tmp_path):
 
 def test_telegram_e2e_rejects_nonisolated_memory_reply_without_leaking_it(tmp_path):
     settings = load_telegram_e2e_settings(write_config(tmp_path))
-    base_response = successful_response_script()
+    base_response, _ = successful_response_script()
 
     def response(command):
         result = base_response(command)
