@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -7,7 +8,7 @@ from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import SQLiteMemoryStore
 from lenkobot.memory_extraction import ExtractionCoordinator
-from lenkobot.personas import Persona, PersonaCatalog, VoicePack
+from lenkobot.personas import Persona, PersonaCatalog, VoicePack, VoiceRenderer
 from lenkobot.session_store import SQLiteSessionStore
 from lenkobot.telegram_presentation import TelegramResponseKind
 from lenkobot.telegram_router import (
@@ -37,6 +38,43 @@ def persona_catalog(version=1, *, voice=None):
         ),
         default_persona_key="companion",
     )
+
+
+def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    assert persona.identity_version == 6
+    assert "не копируй ошибки" in persona.identity_prompt
+    assert "каноническом виде" in persona.identity_prompt
+    assert "не искажай термины" in persona.identity_prompt
+    assert "косвенным признакам" in persona.identity_prompt
+    assert "печатал с телефона" in persona.identity_prompt
+
+
+def test_bro_status_voice_rotates_plain_short_phrases():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    assert persona.identity_version == 6
+    assert persona.voice.status == (
+        "щас вникну",
+        "дай соображу",
+        "разбираюсь",
+        "собираю ответ",
+    )
+
+    renderer = VoiceRenderer()
+    rendered = tuple(
+        renderer.render(persona, "status", fallback="Готовлю ответ")
+        for _ in persona.voice.status
+    )
+
+    assert rendered == persona.voice.status
 
 
 class RecordingResponsePort:
