@@ -19,7 +19,7 @@ e2e = ["telethon==1.44.0"]
 lenkobot = "lenkobot.runtime:main"
 
 [dependency-groups]
-dev = ["pytest==8.3.5"]
+dev = ["pytest==9.0.3"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
