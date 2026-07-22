@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from getpass import getpass
 import os
@@ -13,7 +14,10 @@ from .aiogram_adapter import (
     run_polling,
     verify_bot_identity,
 )
-from .action_confirmation import SQLiteActionConfirmationStore
+from .action_confirmation import (
+    ActionConfirmationService,
+    SQLiteActionConfirmationStore,
+)
 from .application_service import TelegramApplicationService
 from .context_builder import ContextBuilder
 from .live_smoke import run_live_smoke
@@ -25,6 +29,14 @@ from .oauth_credentials import (
     XaiOAuthDeviceClient,
 )
 from .personas import PersonaCatalog
+from .reminder_parser import ReminderParser
+from .reminder_store import SQLiteReminderStore
+from .reminder_worker import (
+    ReminderDeliveryWorker,
+    ReminderScheduler,
+    run_reminder_loop,
+)
+from .reset_coordinator import ResetCoordinator
 from .session_store import SQLiteSessionFinalizer, SQLiteSessionStore
 from .session_summary import XaiSummaryGenerator
 from .telegram_e2e import (
@@ -38,7 +50,7 @@ from .telegram_e2e_credentials import (
     TelegramE2ECredentialState,
     WindowsTelegramE2ECredentialStore,
 )
-from .telegram_presentation import TelegramResponseKind
+from .telegram_presentation import TelegramResponseKind, TelegramResponsePort
 from .telegram_router import (
     IncomingTelegramMessage,
     RoutedTurn,
@@ -236,12 +248,27 @@ class LocalApplication:
     _memory_store: SQLiteMemoryStore
     _session_store: SQLiteSessionStore
     _confirmation_store: SQLiteActionConfirmationStore
+    _reminder_store: SQLiteReminderStore
+    _reminder_worker_store: SQLiteReminderStore
+    _reminder_scheduler: ReminderScheduler
+    _reminder_worker: ReminderDeliveryWorker
+    _reset_coordinator: ResetCoordinator
+
+    async def run_reminders(self, response_port: TelegramResponsePort) -> None:
+        await run_reminder_loop(
+            self._reminder_scheduler,
+            self._reminder_worker,
+            response_port,
+        )
 
     def close(self) -> None:
-        self._conversation_store.close()
-        self._memory_store.close()
-        self._session_store.close()
+        self._reset_coordinator.close()
+        self._reminder_worker_store.close()
+        self._reminder_store.close()
         self._confirmation_store.close()
+        self._session_store.close()
+        self._memory_store.close()
+        self._conversation_store.close()
 
 
 def open_local_application(settings: RuntimeSettings) -> LocalApplication:
@@ -284,72 +311,92 @@ def open_local_application(settings: RuntimeSettings) -> LocalApplication:
 
     settings.data_root.mkdir(parents=True, exist_ok=True)
     database_path = settings.data_root / "state.db"
-    conversation_store = SQLiteConversationStore(database_path)
-    try:
+    with ExitStack() as cleanup:
+        conversation_store = SQLiteConversationStore(database_path)
+        cleanup.callback(conversation_store.close)
         memory_store = SQLiteMemoryStore(database_path)
-    except Exception:
-        conversation_store.close()
-        raise
-    try:
+        cleanup.callback(memory_store.close)
         session_store = SQLiteSessionStore(database_path)
-    except Exception:
-        conversation_store.close()
-        memory_store.close()
-        raise
-    try:
+        cleanup.callback(session_store.close)
         confirmation_store = SQLiteActionConfirmationStore(database_path)
-    except Exception:
-        conversation_store.close()
-        memory_store.close()
-        session_store.close()
-        raise
-    extraction_service = MemoryExtractionService(
-        memory_store,
-        session_store,
-        structured_provider,
-    )
-    extraction_coordinator = ExtractionCoordinator(
-        memory_store,
-        extraction_service,
-    )
-    extraction_coordinator.recover_for_user(owner_user_id=settings.allowed_user_id)
-    session_finalizer = SQLiteSessionFinalizer(
-        database_path,
-        XaiSummaryGenerator(structured_provider),
-        extraction_store=memory_store,
-        extraction_processor=extraction_service,
-    )
+        cleanup.callback(confirmation_store.close)
+        reminder_store = SQLiteReminderStore(database_path)
+        cleanup.callback(reminder_store.close)
+        reminder_worker_store = SQLiteReminderStore(database_path)
+        cleanup.callback(reminder_worker_store.close)
+        reset_coordinator = ResetCoordinator(
+            database_path,
+            required_hooks=("tasks",),
+        )
+        cleanup.callback(reset_coordinator.close)
 
-    router = TelegramRouter(
-        settings.allowed_user_id,
-        conversation_store,
-        _DiscardingReplyPort(),
-        settings.persona_catalog,
-    )
-    service = TelegramApplicationService(
-        router,
-        settings.persona_catalog,
-        provider,
-        context_builder=ContextBuilder(
+        confirmation_service = ActionConfirmationService(confirmation_store)
+        reminder_scheduler = ReminderScheduler(reminder_worker_store)
+        reminder_worker = ReminderDeliveryWorker(
+            reminder_worker_store,
+            confirmation_service,
+        )
+        reset_coordinator.register_quiesce_hook(reminder_worker.quiesce)
+        reset_coordinator.register_purge_hook("tasks", reminder_store.purge_owner)
+
+        extraction_service = MemoryExtractionService(
             memory_store,
-            transcript_store=session_store,
-        ),
-        memory_store=memory_store,
-        session_store=session_store,
-        extraction_service=extraction_service,
-        extraction_coordinator=extraction_coordinator,
-        session_finalizer=session_finalizer,
-        persona_config_path=settings.config_path,
-        confirmation_store=confirmation_store,
-        tool_loop=tool_loop,
-    )
-    return LocalApplication(
-        service,
-        conversation_store,
-        memory_store,
-        session_store,
-        confirmation_store,
-    )
+            session_store,
+            structured_provider,
+        )
+        extraction_coordinator = ExtractionCoordinator(
+            memory_store,
+            extraction_service,
+        )
+        extraction_coordinator.recover_for_user(
+            owner_user_id=settings.allowed_user_id
+        )
+        session_finalizer = SQLiteSessionFinalizer(
+            database_path,
+            XaiSummaryGenerator(structured_provider),
+            extraction_store=memory_store,
+            extraction_processor=extraction_service,
+        )
+
+        router = TelegramRouter(
+            settings.allowed_user_id,
+            conversation_store,
+            _DiscardingReplyPort(),
+            settings.persona_catalog,
+        )
+        service = TelegramApplicationService(
+            router,
+            settings.persona_catalog,
+            provider,
+            context_builder=ContextBuilder(
+                memory_store,
+                transcript_store=session_store,
+            ),
+            memory_store=memory_store,
+            session_store=session_store,
+            extraction_service=extraction_service,
+            extraction_coordinator=extraction_coordinator,
+            session_finalizer=session_finalizer,
+            persona_config_path=settings.config_path,
+            confirmation_service=confirmation_service,
+            tool_loop=tool_loop,
+            reminder_store=reminder_store,
+            reminder_parser=ReminderParser(structured_provider),
+        )
+        application = LocalApplication(
+            service,
+            conversation_store,
+            memory_store,
+            session_store,
+            confirmation_store,
+            reminder_store,
+            reminder_worker_store,
+            reminder_scheduler,
+            reminder_worker,
+            reset_coordinator,
+        )
+        cleanup.pop_all()
+        return application
 
 
 async def run_application(
@@ -369,6 +416,7 @@ async def run_application(
             application.service,
             response_port_factory=response_port_factory,
             command_scope_chat_id=settings.allowed_user_id,
+            background_runner=application.run_reminders,
         )
     finally:
         application.close()

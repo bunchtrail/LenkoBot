@@ -3,7 +3,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from lenkobot.action_confirmation import SQLiteActionConfirmationStore
+from lenkobot.action_confirmation import (
+    ActionConfirmationService,
+    SQLiteActionConfirmationStore,
+)
 from lenkobot.application_service import TelegramApplicationService
 from lenkobot.context_builder import ContextBuilder
 from lenkobot.memory import MemoryScope, NewMemory, SQLiteMemoryStore
@@ -13,6 +16,7 @@ from lenkobot.session_store import (
     SQLiteSessionFinalizer,
     SQLiteSessionStore,
 )
+from lenkobot.sqlite_schema import open_state_database
 from lenkobot.telegram_presentation import (
     TelegramInlineButton,
     TelegramParseMode,
@@ -197,9 +201,11 @@ def build_service(
         persona_catalog=catalog,
     )
     if confirmation_store == "auto":
-        confirmation_store = SQLiteActionConfirmationStore(
-            tmp_path / "state.db",
-            clock=confirmation_clock,
+        confirmation_store = ActionConfirmationService(
+            SQLiteActionConfirmationStore(
+                tmp_path / "state.db",
+                clock=confirmation_clock,
+            )
         )
     return TelegramApplicationService(
         router=router,
@@ -211,7 +217,7 @@ def build_service(
         session_store=session_store,
         extraction_service=extraction_service,
         session_finalizer=session_finalizer,
-        confirmation_store=confirmation_store,
+        confirmation_service=confirmation_store,
         tool_loop=tool_loop,
     ), router
 
@@ -1265,6 +1271,12 @@ def test_new_cancel_keeps_session_active(tmp_path):
         )
         is not None
     )
+    check = open_state_database(database_path)
+    outcome = check.execute(
+        "SELECT outcome FROM action_confirmation ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()[0]
+    check.close()
+    assert outcome == "cancelled"
 
 
 def test_confirmation_replay_does_not_repeat_action(tmp_path):

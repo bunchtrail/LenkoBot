@@ -5,6 +5,7 @@ import lenkobot.aiogram_adapter as aiogram_adapter
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 from lenkobot.aiogram_adapter import (
+    AiogramBackgroundResponsePort,
     AiogramBotResponsePort,
     AiogramTelegramAdapter,
     AiogramTelegramReplyResponsePort,
@@ -269,6 +270,118 @@ def test_bot_response_port_is_fixed_to_owner_and_marks_smoke_messages():
             )
         )
     assert bot.messages == [(42, "[SMOKE] check complete")]
+
+
+def test_background_response_port_sends_to_persisted_chat_without_smoke_prefix():
+    bot = RecordingSendBot()
+    port = AiogramBackgroundResponsePort(bot)
+
+    handle = asyncio.run(
+        port.send(
+            TelegramResponse(
+                chat_id=500,
+                kind=TelegramResponseKind.FINAL,
+                text="напоминание: проверить",
+                inline_keyboard=(
+                    (
+                        TelegramInlineButton(
+                            text="Готово",
+                            callback_data="confirm:v1:token",
+                        ),
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert handle == TelegramSentMessage(chat_id=500, message_id=1)
+    assert bot.messages == [(500, "напоминание: проверить")]
+
+
+def test_run_polling_runs_and_cancels_background_with_same_bot(monkeypatch):
+    background_started = asyncio.Event()
+    background_cancelled = []
+
+    class CoordinatedDispatcher(RecordingDispatcher):
+        async def start_polling(self, bot, *, allowed_updates):
+            await background_started.wait()
+            self.started_with = (bot, allowed_updates)
+
+    dispatcher = CoordinatedDispatcher()
+    monkeypatch.setattr(aiogram_adapter, "Bot", RecordingBot)
+    monkeypatch.setattr(
+        aiogram_adapter,
+        "create_dispatcher",
+        lambda router, **kwargs: dispatcher,
+    )
+
+    async def background(port):
+        assert port._bot is RecordingBot.instances[-1]
+        background_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            background_cancelled.append(True)
+
+    asyncio.run(
+        aiogram_adapter.run_polling(
+            "123:token",
+            RecordingRouter(),
+            background_runner=background,
+        )
+    )
+
+    assert dispatcher.started_with[0] is RecordingBot.instances[-1]
+    assert background_cancelled == [True]
+
+
+def test_run_polling_stops_when_background_runner_fails(monkeypatch):
+    polling_cancelled = []
+
+    class BackgroundFailure(RuntimeError):
+        pass
+
+    class BlockingDispatcher(RecordingDispatcher):
+        async def start_polling(self, bot, *, allowed_updates):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                polling_cancelled.append(True)
+
+    dispatcher = BlockingDispatcher()
+    monkeypatch.setattr(aiogram_adapter, "Bot", RecordingBot)
+    monkeypatch.setattr(
+        aiogram_adapter,
+        "create_dispatcher",
+        lambda router, **kwargs: dispatcher,
+    )
+
+    async def background(port):
+        raise BackgroundFailure("reminder worker failed")
+
+    async def scenario():
+        task = asyncio.create_task(
+            aiogram_adapter.run_polling(
+                "123:token",
+                RecordingRouter(),
+                background_runner=background,
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if task.done():
+                break
+        completed_without_external_cancellation = task.done()
+        if not task.done():
+            task.cancel()
+        outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+        return completed_without_external_cancellation, outcome
+
+    completed, outcome = asyncio.run(scenario())
+
+    assert completed is True
+    assert isinstance(outcome, BackgroundFailure)
+    assert polling_cancelled == [True]
 
 
 def test_e2e_reply_response_port_correlates_to_source_message():

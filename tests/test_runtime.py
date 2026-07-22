@@ -322,6 +322,21 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
         def close(self):
             type(self).closed += 1
 
+    class RecordingReminderStore:
+        paths = []
+        instances = []
+        closed = 0
+
+        def __init__(self, database_path, **kwargs):
+            self.paths.append(database_path)
+            self.instances.append(self)
+
+        def purge_owner(self, owner_user_id, lifecycle_epoch):
+            pass
+
+        def close(self):
+            type(self).closed += 1
+
     observed = {}
 
     async def polling(
@@ -330,11 +345,13 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
         *,
         response_port_factory,
         command_scope_chat_id,
+        background_runner,
     ):
         observed["bot_token"] = bot_token
         observed["handler"] = handler
         observed["response_port_factory"] = response_port_factory
         observed["command_scope_chat_id"] = command_scope_chat_id
+        observed["background_runner"] = background_runner
         if polling_error is not None:
             raise polling_error
 
@@ -343,6 +360,7 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     monkeypatch.setattr(runtime, "SQLiteConversationStore", RecordingConversationStore)
     monkeypatch.setattr(runtime, "SQLiteMemoryStore", RecordingMemoryStore)
     monkeypatch.setattr(runtime, "SQLiteSessionStore", RecordingSessionStore)
+    monkeypatch.setattr(runtime, "SQLiteReminderStore", RecordingReminderStore)
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     settings = load_runtime_settings(write_config(tmp_path))
 
@@ -356,14 +374,99 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
     assert RecordingConversationStore.paths == [expected_database_path]
     assert RecordingMemoryStore.paths == [expected_database_path]
     assert RecordingSessionStore.paths == [expected_database_path]
+    assert RecordingReminderStore.paths == [
+        expected_database_path,
+        expected_database_path,
+    ]
     assert RecordingConversationStore.closed == 1
     assert RecordingMemoryStore.closed == 1
     assert RecordingSessionStore.closed == 1
+    assert RecordingReminderStore.closed == 2
     assert RecordingMemoryStore.recovery_users == [settings.allowed_user_id]
     assert observed["bot_token"] == "telegram-secret"
     assert isinstance(observed["handler"], TelegramApplicationService)
+    assert observed["handler"]._reminder_store is RecordingReminderStore.instances[0]
     assert observed["response_port_factory"] is AiogramTelegramResponsePort
     assert observed["command_scope_chat_id"] == settings.allowed_user_id
+    assert callable(observed["background_runner"])
+
+
+def test_local_application_reset_quiesces_worker_and_purges_reminders(
+    tmp_path,
+    monkeypatch,
+):
+    import lenkobot.runtime as runtime
+    from lenkobot.telegram_router import IncomingTelegramMessage
+
+    class ExistingCredentialStore:
+        target_name = "LenkoBot/xai-oauth/v1/default"
+
+        def load(self):
+            return token_state()
+
+    class FakeMutex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeStructuredProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def respond(self, prompt, *, schema_name, schema):
+            return SimpleNamespace(
+                value={
+                    "text": "Проверить отчёт",
+                    "local_start": "2099-07-22T18:00:00",
+                    "timezone_name": None,
+                    "kind": "once",
+                    "interval": 1,
+                    "weekdays": [],
+                    "monthday": None,
+                    "count": None,
+                    "until_local": None,
+                    "urgent": False,
+                }
+            )
+
+    class RecordingPort:
+        async def send(self, response):
+            return None
+
+    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
+    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(runtime, "XaiStructuredProvider", FakeStructuredProvider)
+    settings = load_runtime_settings(write_config(tmp_path))
+    application = open_local_application(settings)
+    try:
+        asyncio.run(
+            application.service.handle(
+                IncomingTelegramMessage(
+                    user_id=settings.allowed_user_id,
+                    chat_id=500,
+                    chat_type="private",
+                    text="/remind проверить отчёт завтра",
+                ),
+                RecordingPort(),
+            )
+        )
+        assert len(
+            application._reminder_store.list_tasks(
+                owner_user_id=settings.allowed_user_id
+            )
+        ) == 1
+
+        result = application._reset_coordinator.reset(
+            owner_user_id=settings.allowed_user_id
+        )
+
+        assert result.previous_epoch == 1
+        assert result.lifecycle_epoch == 2
+        assert application._reminder_store.list_tasks(
+            owner_user_id=settings.allowed_user_id
+        ) == ()
+        assert (settings.allowed_user_id, 1) in application._reminder_worker._quiesced_epochs
+    finally:
+        application.close()
 
 
 def test_main_composes_confirmed_live_smoke_without_oauth(tmp_path, monkeypatch, capsys):

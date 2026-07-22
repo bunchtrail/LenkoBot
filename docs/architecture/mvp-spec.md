@@ -10,7 +10,7 @@
 
 ## Цель MVP
 
-Личный text-first Telegram-бот для одного пользователя с переключаемыми персонами, общей и приватной памятью и краткой проекцией хода работы. Реализованный baseline запускается локально на Windows; sessions, reminders, web UI, tools и production deployment развиваются только через последовательные фазы [product-roadmap.md](product-roadmap.md).
+Личный text-first Telegram-бот для одного пользователя с переключаемыми персонами, общей и приватной памятью и краткой проекцией хода работы. Реализованный baseline запускается локально на Windows; sessions и reminders добавлены последовательными roadmap-фазами, а web UI, tools и production deployment продолжают развиваться по [product-roadmap.md](product-roadmap.md).
 
 ## Подтверждённые решения
 
@@ -65,9 +65,9 @@
 - Private memory никогда не становится shared автоматически. Повышение scope требует явного действия пользователя.
 - Пользователь может удалить memory record; удаление должно убрать её из canonical SQLite store и из любого перестраиваемого search index.
 
-### Будущие напоминания и доставка
+### Напоминания и доставка
 
-Reminder contract не является частью реализованного MVP baseline. Его подтверждённая модель, включая persona affinity, recurrence, quiet hours, durable outbox и idempotency, принадлежит Phase 3 product roadmap и не должна частично появляться раньше этой фазы.
+Reminder contract не является частью исходного MVP baseline. Его реализованная в Phase 3 модель включает persona affinity, recurrence, quiet hours, durable outbox, lifecycle fences и честную at-least-once transport semantics.
 
 ### Provider и секреты
 
@@ -303,6 +303,45 @@ foreign key без `ON DELETE`; удаление такой version заверш
 Явный owner reset удаляет принадлежащие sessions и lanes с их зависимыми
 данными, но не удаляет `persona` или `persona_version`; отдельная cleanup policy
 потребует отдельного решения и regression test.
+
+## Tasks и durable reminders
+
+`Confirmed`: Phase 3 добавляет owner-scoped `task`, `reminder_job`,
+`reminder_run` и `delivery_outbox` в общий SQLite lifecycle. Task сохраняет
+concrete `persona_id`, chat, lifecycle epoch и статус; job владеет IANA timezone,
+original naive local wall time, versioned recurrence rule, immutable next UTC
+instant, grace/quiet-hours policy и urgent override. Unique
+`(job_id, scheduled_for)` создаёт один logical run, а outbox имеет ровно одну
+строку на run.
+
+- Поддерживаются one-shot и bounded recurrence `daily`, `weekly`, `monthly` с
+  positive interval, weekdays/monthday, optional count/until; cron/free RRULE и
+  calendar integration не входят в contract.
+- Local wall time разрешается stdlib `zoneinfo`: оба `fold` проходят UTC
+  round-trip. Ноль вариантов (nonexistent) и два разных UTC (ambiguous) переводят
+  job в `needs_review`; время не угадывается. Windows получает pinned `tzdata`.
+- Monthly calendar-invalid date пропускается; DST-invalid occurrence не
+  продвигает schedule молча и требует review.
+- Quiet hours не меняют immutable `scheduled_for`; только outbox `available_at`
+  сдвигается к первому разрешённому local instant. Grace считается от
+  `scheduled_for`. Defaults: timezone `UTC`, quiet hours disabled, grace 3600 s.
+- Natural-language flow доступен через `/remind <text>` и private text с явным
+  prefix `напомни`/`remind me`; xAI structured parser создаёт typed draft. До
+  durable one-time confirm task/job остаются `awaiting_confirmation`/`draft` и
+  scheduler их не видит.
+- `/tasks`, `/timezone` и `/quiet` дают owner UI; delivery и list responses имеют
+  inline snooze/cancel/complete controls. Все callbacks проходят прежний early
+  owner/private gate и idempotent store transition.
+- Scheduler в `BEGIN IMMEDIATE` materialize-ит due/missed run, outbox и следующий
+  cursor в одной transaction. Worker lease-ит outbox, повторно проверяет owner
+  lifecycle epoch перед Telegram send и перед persistence.
+- Telegram `sendMessage` не предоставляет idempotency key. Система гарантирует
+  exactly-once logical run/outbox и at-least-once transport: crash после принятого
+  send до persistence может дать повторную доставку. Успешный send после reset
+  фиксируется content-free external-commit audit без восстановления удалённых
+  reminder data.
+- Reminder store предоставляет mandatory reset purge/quiesce hooks; старый epoch
+  не может создать или отправить новую delivery.
 
 ## Не входит в MVP
 

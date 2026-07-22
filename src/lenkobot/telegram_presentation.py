@@ -30,6 +30,22 @@ TELEGRAM_COMMANDS = (
     TelegramCommandDefinition("persona", "/persona", "выбрать персону"),
     TelegramCommandDefinition("new", "/new", "закрыть текущий разговор"),
     TelegramCommandDefinition(
+        "remind",
+        "/remind <что и когда>",
+        "создать напоминание",
+    ),
+    TelegramCommandDefinition("tasks", "/tasks", "показать задачи"),
+    TelegramCommandDefinition(
+        "timezone",
+        "/timezone [IANA timezone]",
+        "настроить часовой пояс",
+    ),
+    TelegramCommandDefinition(
+        "quiet",
+        "/quiet [HH:MM-HH:MM|off]",
+        "настроить тихие часы",
+    ),
+    TelegramCommandDefinition(
         "remember",
         "/remember <text>",
         "сохранить общую запись",

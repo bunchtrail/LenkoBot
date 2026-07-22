@@ -453,6 +453,226 @@ def _create_action_confirmation_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_reminder_schema(connection: sqlite3.Connection) -> None:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "user_profile" not in tables:
+        _create_session_schema(connection)
+    if "persona" not in tables:
+        _create_memory_schema(connection)
+    if "action_confirmation" not in tables:
+        _create_action_confirmation_schema(connection)
+
+    profile_columns = _column_names(connection, "user_profile")
+    if "quiet_start_minute" not in profile_columns:
+        connection.execute(
+            """
+            ALTER TABLE user_profile
+            ADD COLUMN quiet_start_minute INTEGER CHECK(
+                quiet_start_minute IS NULL OR
+                (quiet_start_minute >= 0 AND quiet_start_minute < 1440)
+            )
+            """
+        )
+    if "quiet_end_minute" not in profile_columns:
+        connection.execute(
+            """
+            ALTER TABLE user_profile
+            ADD COLUMN quiet_end_minute INTEGER CHECK(
+                quiet_end_minute IS NULL OR
+                (quiet_end_minute >= 0 AND quiet_end_minute < 1440)
+            )
+            """
+        )
+
+    confirmation_columns = _column_names(connection, "action_confirmation")
+    if "outcome" not in confirmation_columns:
+        connection.execute(
+            """
+            ALTER TABLE action_confirmation
+            ADD COLUMN outcome TEXT CHECK(
+                outcome IS NULL OR outcome IN ('confirmed', 'cancelled')
+            )
+            """
+        )
+    if "resolved_at" not in confirmation_columns:
+        connection.execute(
+            "ALTER TABLE action_confirmation ADD COLUMN resolved_at TEXT"
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL
+                REFERENCES user_profile(user_id) ON DELETE CASCADE,
+            persona_id INTEGER NOT NULL REFERENCES persona(id),
+            chat_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            text TEXT NOT NULL CHECK(
+                length(trim(text)) > 0 AND length(text) <= 1000
+            ),
+            status TEXT NOT NULL CHECK(status IN (
+                'awaiting_confirmation', 'active', 'needs_review',
+                'completed', 'cancelled'
+            )),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(id, owner_user_id, lifecycle_epoch)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS task_owner_status_updated_idx
+            ON task(owner_user_id, status, updated_at DESC, id DESC)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminder_job (
+            id INTEGER PRIMARY KEY,
+            task_id INTEGER NOT NULL,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            status TEXT NOT NULL CHECK(status IN (
+                'draft', 'awaiting_confirmation', 'active', 'needs_review',
+                'completed', 'cancelled'
+            )),
+            timezone_name TEXT NOT NULL CHECK(length(trim(timezone_name)) > 0),
+            local_start TEXT NOT NULL,
+            recurrence_json TEXT NOT NULL CHECK(json_valid(recurrence_json)),
+            next_scheduled_for TEXT,
+            emitted_count INTEGER NOT NULL DEFAULT 0 CHECK(emitted_count >= 0),
+            grace_seconds INTEGER NOT NULL DEFAULT 3600 CHECK(
+                grace_seconds > 0 AND grace_seconds <= 604800
+            ),
+            quiet_start_minute INTEGER CHECK(
+                quiet_start_minute IS NULL OR
+                (quiet_start_minute >= 0 AND quiet_start_minute < 1440)
+            ),
+            quiet_end_minute INTEGER CHECK(
+                quiet_end_minute IS NULL OR
+                (quiet_end_minute >= 0 AND quiet_end_minute < 1440)
+            ),
+            urgent INTEGER NOT NULL DEFAULT 0 CHECK(urgent IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (task_id, owner_user_id, lifecycle_epoch)
+                REFERENCES task(id, owner_user_id, lifecycle_epoch)
+                ON DELETE CASCADE,
+            UNIQUE(id, owner_user_id, lifecycle_epoch)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS reminder_job_due_idx
+            ON reminder_job(status, next_scheduled_for, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminder_run (
+            id INTEGER PRIMARY KEY,
+            job_id INTEGER NOT NULL,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            scheduled_for TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'due', 'missed', 'claimed', 'delivered', 'failed', 'cancelled'
+            )),
+            claimed_at TEXT,
+            delivered_at TEXT,
+            error_kind TEXT CHECK(
+                error_kind IS NULL OR
+                (length(trim(error_kind)) > 0 AND length(error_kind) <= 100)
+            ),
+            action_token TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (job_id, owner_user_id, lifecycle_epoch)
+                REFERENCES reminder_job(id, owner_user_id, lifecycle_epoch)
+                ON DELETE CASCADE,
+            UNIQUE(job_id, scheduled_for),
+            UNIQUE(id, owner_user_id, lifecycle_epoch)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS reminder_run_owner_status_idx
+            ON reminder_run(owner_user_id, status, scheduled_for, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS delivery_outbox (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL UNIQUE,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            chat_id INTEGER NOT NULL,
+            text TEXT NOT NULL CHECK(length(trim(text)) > 0),
+            scheduled_for TEXT NOT NULL,
+            available_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'leased', 'sent', 'failed', 'cancelled'
+            )),
+            attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+            lease_token TEXT,
+            lease_until TEXT,
+            telegram_message_id INTEGER,
+            error_kind TEXT CHECK(
+                error_kind IS NULL OR
+                (length(trim(error_kind)) > 0 AND length(error_kind) <= 100)
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (run_id, owner_user_id, lifecycle_epoch)
+                REFERENCES reminder_run(id, owner_user_id, lifecycle_epoch)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS delivery_outbox_claim_idx
+            ON delivery_outbox(status, available_at, lease_until, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminder_delivery_audit (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            delivery_token TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL CHECK(
+                event_type = 'external_commit_after_reset'
+            ),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _add_reminder_snooze_dedup_schema(connection: sqlite3.Connection) -> None:
+    if "action_token" not in _column_names(connection, "reminder_run"):
+        connection.execute("ALTER TABLE reminder_run ADD COLUMN action_token TEXT")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS reminder_run_action_token_idx
+            ON reminder_run(action_token)
+            WHERE action_token IS NOT NULL
+        """
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_conversation_schema,
     _create_memory_schema,
@@ -461,6 +681,8 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_phase_two_lifecycle_schema,
     _create_persona_version_schema,
     _create_action_confirmation_schema,
+    _create_reminder_schema,
+    _add_reminder_snooze_dedup_schema,
 )
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 

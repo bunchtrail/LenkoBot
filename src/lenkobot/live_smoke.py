@@ -5,7 +5,10 @@ from typing import Protocol
 from uuid import uuid4
 
 from .aiogram_adapter import run_bot_delivery
-from .action_confirmation import SQLiteActionConfirmationStore
+from .action_confirmation import (
+    ActionConfirmationService,
+    SQLiteActionConfirmationStore,
+)
 from .application_service import TelegramApplicationService
 from .memory import SQLiteMemoryStore
 from .personas import PersonaCatalog
@@ -163,7 +166,7 @@ def _open_scenario(
         persona_catalog,
         _ForbiddenProvider(),
         memory_store=memory_store,
-        confirmation_store=confirmation_store,
+        confirmation_service=ActionConfirmationService(confirmation_store),
     )
     return service, memory_store, conversation_store, confirmation_store
 

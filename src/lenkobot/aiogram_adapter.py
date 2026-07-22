@@ -269,6 +269,32 @@ class AiogramBotResponsePort:
         return None
 
 
+class AiogramBackgroundResponsePort:
+    def __init__(self, bot: Bot) -> None:
+        self._bot = bot
+
+    async def send(self, response: TelegramResponse) -> TelegramSentMessage | None:
+        try:
+            kwargs = {
+                "chat_id": response.chat_id,
+                "text": response.text,
+            }
+            markup = _reply_markup(response)
+            if markup is not None:
+                kwargs["reply_markup"] = markup
+            if response.parse_mode is not None:
+                kwargs["parse_mode"] = response.parse_mode.value
+            sent = await self._bot.send_message(**kwargs)
+        except Exception as error:
+            raise TelegramDeliveryError(
+                "Telegram Bot API background delivery failed"
+            ) from error
+        return TelegramSentMessage(
+            chat_id=response.chat_id,
+            message_id=sent.message_id,
+        )
+
+
 async def run_bot_delivery(
     bot_token: str,
     target_chat_id: int,
@@ -399,6 +425,7 @@ async def run_polling(
     *,
     response_port_factory: Callable[[Message], TelegramResponsePort] | None = None,
     command_scope_chat_id: int | None = None,
+    background_runner: Callable[[TelegramResponsePort], Awaitable[None]] | None = None,
 ) -> None:
     if not bot_token.strip():
         raise ValueError("Telegram bot token cannot be empty")
@@ -413,10 +440,40 @@ async def run_polling(
     async with Bot(token=bot_token) as bot:
         if command_scope_chat_id is not None:
             await register_owner_command_menu(bot, command_scope_chat_id)
-        await dispatcher.start_polling(
-            bot,
-            allowed_updates=dispatcher.resolve_used_update_types(),
+        if background_runner is None:
+            await dispatcher.start_polling(
+                bot,
+                allowed_updates=dispatcher.resolve_used_update_types(),
+            )
+            return
+        background_task = asyncio.create_task(
+            background_runner(AiogramBackgroundResponsePort(bot))
         )
+        polling_task = asyncio.create_task(
+            dispatcher.start_polling(
+                bot,
+                allowed_updates=dispatcher.resolve_used_update_types(),
+            )
+        )
+        try:
+            completed, _ = await asyncio.wait(
+                (polling_task, background_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if polling_task in completed:
+                await polling_task
+                return
+            await background_task
+            raise RuntimeError("Telegram background runner stopped unexpectedly")
+        finally:
+            for task in (polling_task, background_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                polling_task,
+                background_task,
+                return_exceptions=True,
+            )
 
 
 async def register_owner_command_menu(bot: Bot, owner_user_id: int) -> None:

@@ -1,13 +1,27 @@
 import asyncio
 from dataclasses import replace
+from datetime import datetime
 import math
 from pathlib import Path
+import re
 from typing import Protocol
 
-from .action_confirmation import ConfirmationAction
+from .action_confirmation import ConfirmationAction, ConfirmationResolution
 from .memory import MemoryExtractionRun, MemoryRecord, MemoryScope, NewMemory
 from .memory_extraction import ExtractionCoordinator
 from .personas import Persona, PersonaCatalog, VoiceRenderer
+from .reminder_parser import ParsedReminder, extract_reminder_request
+from .reminder_schedule import ScheduleKind
+from .reminder_store import (
+    ProfileReminderPolicy,
+    ReminderDraft,
+    ReminderJob,
+    ReminderJobStatus,
+    ReminderRun,
+    ReminderRunStatus,
+    TaskRecord,
+    TaskStatus,
+)
 from .session_store import FailureStage, TranscriptFailure, TranscriptTurn
 from .session_store import SessionFinalizer
 from .telegram_presentation import (
@@ -95,8 +109,8 @@ class MemoryCommandStore(Protocol):
     ) -> MemoryExtractionRun: ...
 
 
-class ConfirmationStore(Protocol):
-    def create(
+class ConfirmationService(Protocol):
+    def request(
         self,
         *,
         owner_user_id: int,
@@ -104,12 +118,74 @@ class ConfirmationStore(Protocol):
         payload: dict,
     ) -> str: ...
 
-    def consume(
+    def resolve(
         self,
         *,
         token: str,
         owner_user_id: int,
-    ) -> ConfirmationAction | None: ...
+        confirmed: bool,
+    ) -> ConfirmationResolution | None: ...
+
+
+class ReminderParserPort(Protocol):
+    def parse(self, request: str, *, default_timezone: str) -> ParsedReminder: ...
+
+
+class ReminderStore(Protocol):
+    def ensure_profile(self, *, owner_user_id: int) -> ProfileReminderPolicy: ...
+
+    def get_profile_policy(self, *, owner_user_id: int) -> ProfileReminderPolicy: ...
+
+    def set_profile_policy(
+        self,
+        *,
+        owner_user_id: int,
+        timezone_name: str,
+        quiet_start_minute: int | None,
+        quiet_end_minute: int | None,
+    ) -> ProfileReminderPolicy: ...
+
+    def persona_id_for_key(self, persona_key: str) -> int | None: ...
+
+    def create_draft(self, draft: ReminderDraft): ...
+
+    def mark_awaiting_confirmation(
+        self,
+        *,
+        task_id: int,
+        owner_user_id: int,
+    ) -> ReminderJob: ...
+
+    def activate(self, *, task_id: int, owner_user_id: int) -> ReminderJob: ...
+
+    def get_task(self, *, task_id: int, owner_user_id: int) -> TaskRecord | None: ...
+
+    def get_job_for_task(
+        self,
+        *,
+        task_id: int,
+        owner_user_id: int,
+    ) -> ReminderJob | None: ...
+
+    def list_tasks(
+        self,
+        *,
+        owner_user_id: int,
+        limit: int = 100,
+    ) -> tuple[TaskRecord, ...]: ...
+
+    def cancel_task(self, *, task_id: int, owner_user_id: int) -> TaskRecord: ...
+
+    def complete_task(self, *, task_id: int, owner_user_id: int) -> TaskRecord: ...
+
+    def snooze_task(
+        self,
+        *,
+        task_id: int,
+        owner_user_id: int,
+        action_token: str,
+        delay_seconds: int = 600,
+    ) -> ReminderRun: ...
 
 
 class TranscriptStore(Protocol):
@@ -177,6 +253,16 @@ _MEMORY_PAGE_SIZE = 5
 _MAX_REMEMBER_LENGTH = 500
 _SNIPPET_LENGTH = 60
 _STALE_CALLBACK_TEXT = "Кнопка устарела. Повторите команду ещё раз."
+_REMINDER_ACTION_TYPES = frozenset(
+    {
+        "activate_reminder",
+        "cancel_reminder",
+        "complete_reminder",
+        "snooze_reminder",
+    }
+)
+_REMINDER_TASK_LIMIT = 10
+_SNOOZE_SECONDS = 600
 
 
 def _snippet(text: str, *, limit: int = _SNIPPET_LENGTH) -> str:
@@ -200,8 +286,10 @@ class TelegramApplicationService:
         extraction_coordinator: ExtractionCoordinatorPort | None = None,
         session_finalizer: SessionFinalizer | None = None,
         persona_config_path: Path | None = None,
-        confirmation_store: ConfirmationStore | None = None,
+        confirmation_service: ConfirmationService | None = None,
         tool_loop: WebSearchToolLoop | None = None,
+        reminder_store: ReminderStore | None = None,
+        reminder_parser: ReminderParserPort | None = None,
     ) -> None:
         self._router = router
         self._persona_catalog = persona_catalog
@@ -223,8 +311,10 @@ class TelegramApplicationService:
             )
         self._session_finalizer = session_finalizer
         self._persona_config_path = persona_config_path
-        self._confirmation_store = confirmation_store
+        self._confirmation_service = confirmation_service
         self._tool_loop = tool_loop
+        self._reminder_store = reminder_store
+        self._reminder_parser = reminder_parser
         self._voice_renderer = VoiceRenderer()
 
     async def handle(
@@ -238,6 +328,18 @@ class TelegramApplicationService:
                 return None
             presenter = self._response_port_for(response_port)
             return await self._handle_command(message, command, presenter)
+
+        reminder_request = extract_reminder_request(message.text)
+        if reminder_request is not None:
+            if not self._router.is_authorized(message.user_id, message.chat_type):
+                return None
+            presenter = self._response_port_for(response_port)
+            await self._handle_reminder_request(
+                message,
+                reminder_request,
+                presenter,
+            )
+            return None
 
         turn = self._router.route(message)
         if turn is None:
@@ -572,18 +674,22 @@ class TelegramApplicationService:
         confirmed: bool,
         token: str,
     ) -> None:
-        if self._confirmation_store is None:
+        if self._confirmation_service is None:
             await self._send_command_error(
                 callback.chat_id,
                 presenter,
                 _STALE_CALLBACK_TEXT,
             )
             return
-        action = self._confirmation_store.consume(
+        resolution = self._confirmation_service.resolve(
             token=token,
             owner_user_id=callback.user_id,
+            confirmed=confirmed,
         )
-        if action is None:
+        if resolution is None or (
+            not resolution.first_resolution
+            and resolution.action.action_type not in _REMINDER_ACTION_TYPES
+        ):
             await self._send_callback_result(
                 callback,
                 presenter,
@@ -591,8 +697,25 @@ class TelegramApplicationService:
                 kind=TelegramResponseKind.ERROR,
             )
             return
+        action = resolution.action
         if not confirmed:
+            if (
+                action.action_type == "activate_reminder"
+                and self._reminder_store is not None
+            ):
+                task_id = action.payload.get("task_id")
+                if isinstance(task_id, int) and not isinstance(task_id, bool):
+                    try:
+                        self._reminder_store.cancel_task(
+                            task_id=task_id,
+                            owner_user_id=callback.user_id,
+                        )
+                    except Exception:
+                        pass
             await self._send_callback_result(callback, presenter, "Отменено.")
+            return
+        if action.action_type in _REMINDER_ACTION_TYPES:
+            await self._execute_reminder_action(callback, presenter, action)
             return
         if action.action_type == "forget_memory":
             await self._execute_confirmed_forget(callback, presenter, action)
@@ -706,6 +829,86 @@ class TelegramApplicationService:
             presenter,
             "Разговор закрыт. Следующее сообщение начнёт новый.",
         )
+
+    async def _execute_reminder_action(
+        self,
+        callback: IncomingTelegramCallback,
+        presenter: TelegramResponsePort,
+        action: ConfirmationAction,
+    ) -> None:
+        task_id = action.payload.get("task_id")
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id < 1
+            or self._reminder_store is None
+        ):
+            await self._send_callback_result(
+                callback,
+                presenter,
+                _STALE_CALLBACK_TEXT,
+                kind=TelegramResponseKind.ERROR,
+            )
+            return
+        try:
+            if action.action_type == "activate_reminder":
+                job = self._reminder_store.activate(
+                    task_id=task_id,
+                    owner_user_id=callback.user_id,
+                )
+                if job.status is ReminderJobStatus.NEEDS_REVIEW:
+                    text = (
+                        "Время попало в переход часового пояса. "
+                        "Создайте напоминание с другим временем."
+                    )
+                else:
+                    text = (
+                        "Напоминание создано: "
+                        f"{_format_local_datetime(job.local_start)} "
+                        f"({job.timezone_name})."
+                    )
+            elif action.action_type == "cancel_reminder":
+                self._reminder_store.cancel_task(
+                    task_id=task_id,
+                    owner_user_id=callback.user_id,
+                )
+                text = "Напоминание отменено."
+            elif action.action_type == "complete_reminder":
+                self._reminder_store.complete_task(
+                    task_id=task_id,
+                    owner_user_id=callback.user_id,
+                )
+                text = "Задача выполнена."
+            elif action.action_type == "snooze_reminder":
+                delay_seconds = action.payload.get("delay_seconds")
+                if (
+                    isinstance(delay_seconds, bool)
+                    or not isinstance(delay_seconds, int)
+                    or delay_seconds != _SNOOZE_SECONDS
+                ):
+                    raise ValueError("reminder snooze payload is invalid")
+                run = self._reminder_store.snooze_task(
+                    task_id=task_id,
+                    owner_user_id=callback.user_id,
+                    action_token=action.token,
+                    delay_seconds=delay_seconds,
+                )
+                text = (
+                    "Напомню снова через 10 минут."
+                    if run.status is ReminderRunStatus.DUE
+                    else "Не удалось отложить напоминание из-за quiet hours."
+                )
+            else:
+                raise ValueError("unknown reminder action")
+        except (KeyError, PermissionError, RuntimeError, ValueError):
+            await self._send_callback_result(
+                callback,
+                presenter,
+                _STALE_CALLBACK_TEXT,
+                kind=TelegramResponseKind.ERROR,
+            )
+            return
+        await self._send_callback_result(callback, presenter, text)
 
     async def _handle_memories_page_callback(
         self,
@@ -989,6 +1192,22 @@ class TelegramApplicationService:
             )
             return None
 
+        if command.name == "remind":
+            await self._handle_remind_command(message, command, presenter)
+            return None
+
+        if command.name == "tasks":
+            await self._handle_tasks(message, command, presenter)
+            return None
+
+        if command.name == "timezone":
+            await self._handle_timezone(message, command, presenter)
+            return None
+
+        if command.name == "quiet":
+            await self._handle_quiet(message, command, presenter)
+            return None
+
         if command.name == "new":
             await self._handle_new(message, command, presenter)
             return None
@@ -1111,10 +1330,10 @@ class TelegramApplicationService:
         chat_type: str,
         record: MemoryRecord,
     ) -> TelegramResponse | None:
-        if self._confirmation_store is None:
+        if self._confirmation_service is None:
             return None
         try:
-            token = self._confirmation_store.create(
+            token = self._confirmation_service.request(
                 owner_user_id=user_id,
                 action_type="forget_memory",
                 payload={"memory_id": record.id},
@@ -1204,6 +1423,327 @@ class TelegramApplicationService:
             inline_keyboard=(tuple(buttons),) if buttons else (),
         )
 
+    async def _handle_remind_command(
+        self,
+        message: IncomingTelegramMessage,
+        command: TelegramCommand,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        request = " ".join(command.arguments).strip()
+        if not request:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Формат команды: /remind <что и когда>.",
+            )
+            return
+        await self._handle_reminder_request(message, request, presenter)
+
+    async def _handle_reminder_request(
+        self,
+        message: IncomingTelegramMessage,
+        request: str,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        if (
+            self._reminder_store is None
+            or self._reminder_parser is None
+            or self._confirmation_service is None
+        ):
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Напоминания сейчас недоступны.",
+            )
+            return
+        if not request:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Напишите, что и когда напомнить.",
+            )
+            return
+        try:
+            policy = self._reminder_store.ensure_profile(
+                owner_user_id=message.user_id
+            )
+            turn = self._router.route(
+                IncomingTelegramMessage(
+                    user_id=message.user_id,
+                    chat_id=message.chat_id,
+                    chat_type=message.chat_type,
+                    text=request,
+                )
+            )
+            if turn is None:
+                return
+            persona_id = self._reminder_store.persona_id_for_key(turn.persona_key)
+            if persona_id is None:
+                raise RuntimeError("active reminder persona is unavailable")
+            parsed = await asyncio.to_thread(
+                self._reminder_parser.parse,
+                request,
+                default_timezone=policy.timezone_name,
+            )
+            created = self._reminder_store.create_draft(
+                ReminderDraft(
+                    owner_user_id=message.user_id,
+                    persona_id=persona_id,
+                    chat_id=message.chat_id,
+                    text=parsed.text,
+                    local_start=parsed.local_start,
+                    timezone_name=parsed.timezone_name,
+                    recurrence=parsed.recurrence,
+                    quiet_start_minute=policy.quiet_start_minute,
+                    quiet_end_minute=policy.quiet_end_minute,
+                    urgent=parsed.urgent,
+                )
+            )
+            self._reminder_store.mark_awaiting_confirmation(
+                task_id=created.task.id,
+                owner_user_id=message.user_id,
+            )
+            token = self._confirmation_service.request(
+                owner_user_id=message.user_id,
+                action_type="activate_reminder",
+                payload={"task_id": created.task.id},
+            )
+        except Exception:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Не удалось разобрать напоминание. Уточните дату и время.",
+            )
+            return
+        recurrence = _format_recurrence(parsed)
+        prompt = (
+            f"Создать напоминание «{parsed.text}» на "
+            f"{_format_local_datetime(parsed.local_start)} "
+            f"({parsed.timezone_name}){recurrence}?"
+        )
+        await presenter.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text=self._command_voice(message, prompt),
+                inline_keyboard=(
+                    (
+                        TelegramInlineButton(
+                            text="Создать",
+                            callback_data=confirmation_callback_data(
+                                "confirm",
+                                token,
+                            ),
+                        ),
+                        TelegramInlineButton(
+                            text="Отмена",
+                            callback_data=confirmation_callback_data(
+                                "cancel",
+                                token,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+    async def _handle_tasks(
+        self,
+        message: IncomingTelegramMessage,
+        command: TelegramCommand,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        if command.arguments:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Формат команды: /tasks.",
+            )
+            return
+        if self._reminder_store is None:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Напоминания сейчас недоступны.",
+            )
+            return
+        try:
+            tasks = self._reminder_store.list_tasks(
+                owner_user_id=message.user_id,
+                limit=_REMINDER_TASK_LIMIT,
+            )
+        except Exception:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Не удалось загрузить задачи.",
+            )
+            return
+        if not tasks:
+            await presenter.send(
+                TelegramResponse(
+                    chat_id=message.chat_id,
+                    kind=TelegramResponseKind.FINAL,
+                    text=self._command_voice(message, "Задач пока нет."),
+                )
+            )
+            return
+        lines = ["Задачи:"]
+        keyboard = []
+        for task in tasks:
+            job = self._reminder_store.get_job_for_task(
+                task_id=task.id,
+                owner_user_id=message.user_id,
+            )
+            status = _task_status_label(task.status)
+            schedule = ""
+            if job is not None and job.next_scheduled_for is not None:
+                schedule = (
+                    " · следующее: "
+                    f"{_format_utc_datetime(job.next_scheduled_for)}"
+                )
+            lines.append(
+                f"{task.id}. {task.text} · {status}{schedule}"
+            )
+            buttons = self._reminder_task_buttons(
+                owner_user_id=message.user_id,
+                task=task,
+            )
+            if buttons:
+                keyboard.append(buttons)
+        await presenter.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text=self._command_voice(message, "\n".join(lines)),
+                inline_keyboard=tuple(keyboard),
+            )
+        )
+
+    def _reminder_task_buttons(
+        self,
+        *,
+        owner_user_id: int,
+        task: TaskRecord,
+    ) -> tuple[TelegramInlineButton, ...]:
+        if self._confirmation_service is None:
+            return ()
+        actions = []
+        if task.status is TaskStatus.ACTIVE:
+            actions.extend(
+                (
+                    ("Через 10 минут", "snooze_reminder", {"delay_seconds": _SNOOZE_SECONDS}),
+                    ("Готово", "complete_reminder", {}),
+                    ("Отменить", "cancel_reminder", {}),
+                )
+            )
+        elif task.status in {
+            TaskStatus.AWAITING_CONFIRMATION,
+            TaskStatus.NEEDS_REVIEW,
+        }:
+            actions.append(("Отменить", "cancel_reminder", {}))
+        buttons = []
+        for label, action_type, extra_payload in actions:
+            try:
+                token = self._confirmation_service.request(
+                    owner_user_id=owner_user_id,
+                    action_type=action_type,
+                    payload={"task_id": task.id, **extra_payload},
+                )
+                data = confirmation_callback_data("confirm", token)
+            except Exception:
+                continue
+            buttons.append(TelegramInlineButton(text=label, callback_data=data))
+        return tuple(buttons)
+
+    async def _handle_timezone(
+        self,
+        message: IncomingTelegramMessage,
+        command: TelegramCommand,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        if len(command.arguments) > 1 or self._reminder_store is None:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Формат команды: /timezone [IANA timezone].",
+            )
+            return
+        try:
+            policy = self._reminder_store.ensure_profile(
+                owner_user_id=message.user_id
+            )
+            if command.arguments:
+                policy = self._reminder_store.set_profile_policy(
+                    owner_user_id=message.user_id,
+                    timezone_name=command.arguments[0],
+                    quiet_start_minute=policy.quiet_start_minute,
+                    quiet_end_minute=policy.quiet_end_minute,
+                )
+        except (KeyError, ValueError):
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Неизвестная timezone. Используйте IANA-имя, например Europe/Moscow.",
+            )
+            return
+        await presenter.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text=self._command_voice(
+                    message,
+                    f"Timezone: {policy.timezone_name}.",
+                ),
+            )
+        )
+
+    async def _handle_quiet(
+        self,
+        message: IncomingTelegramMessage,
+        command: TelegramCommand,
+        presenter: TelegramResponsePort,
+    ) -> None:
+        if len(command.arguments) > 1 or self._reminder_store is None:
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Формат команды: /quiet [HH:MM-HH:MM|off].",
+            )
+            return
+        try:
+            policy = self._reminder_store.ensure_profile(
+                owner_user_id=message.user_id
+            )
+            if command.arguments:
+                value = command.arguments[0]
+                quiet = (
+                    (None, None)
+                    if value.casefold() == "off"
+                    else _parse_quiet_range(value)
+                )
+                policy = self._reminder_store.set_profile_policy(
+                    owner_user_id=message.user_id,
+                    timezone_name=policy.timezone_name,
+                    quiet_start_minute=quiet[0],
+                    quiet_end_minute=quiet[1],
+                )
+        except (KeyError, ValueError):
+            await self._send_command_error(
+                message.chat_id,
+                presenter,
+                "Quiet hours задаются как HH:MM-HH:MM или off.",
+            )
+            return
+        quiet_text = _format_quiet_policy(policy)
+        await presenter.send(
+            TelegramResponse(
+                chat_id=message.chat_id,
+                kind=TelegramResponseKind.FINAL,
+                text=self._command_voice(message, quiet_text),
+            )
+        )
+
     async def _handle_persona_reload(
         self,
         message: IncomingTelegramMessage,
@@ -1277,7 +1817,7 @@ class TelegramApplicationService:
                 )
             )
             return
-        if self._confirmation_store is None:
+        if self._confirmation_service is None:
             await self._send_command_error(
                 message.chat_id,
                 presenter,
@@ -1285,7 +1825,7 @@ class TelegramApplicationService:
             )
             return
         try:
-            token = self._confirmation_store.create(
+            token = self._confirmation_service.request(
                 owner_user_id=message.user_id,
                 action_type="close_session",
                 payload={
@@ -1548,3 +2088,65 @@ class TelegramApplicationService:
             presenter,
             "Память сейчас недоступна. Попробуйте ещё раз.",
         )
+
+
+def _format_local_datetime(value: datetime) -> str:
+    return value.strftime("%d.%m.%Y %H:%M")
+
+
+def _format_utc_datetime(value: datetime) -> str:
+    return value.strftime("%d.%m.%Y %H:%M UTC")
+
+
+def _format_recurrence(parsed: ParsedReminder) -> str:
+    rule = parsed.recurrence
+    if rule.kind is ScheduleKind.ONCE:
+        return ""
+    if rule.kind is ScheduleKind.DAILY:
+        description = f", каждые {rule.interval} дн."
+    elif rule.kind is ScheduleKind.WEEKLY:
+        weekdays = ",".join(str(day + 1) for day in rule.weekdays)
+        description = f", еженедельно по дням {weekdays}"
+    else:
+        monthday = rule.monthday or parsed.local_start.day
+        description = f", ежемесячно {monthday}-го числа"
+    if rule.count is not None:
+        description += f", {rule.count} раз"
+    return description
+
+
+def _task_status_label(status: TaskStatus) -> str:
+    return {
+        TaskStatus.AWAITING_CONFIRMATION: "ждёт подтверждения",
+        TaskStatus.ACTIVE: "активна",
+        TaskStatus.NEEDS_REVIEW: "нужно уточнить время",
+        TaskStatus.COMPLETED: "выполнена",
+        TaskStatus.CANCELLED: "отменена",
+    }[status]
+
+
+def _parse_quiet_range(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d{2}):(\d{2})-(\d{2}):(\d{2})", value)
+    if match is None:
+        raise ValueError("quiet hours format is invalid")
+    start_hour, start_minute, end_hour, end_minute = (
+        int(part) for part in match.groups()
+    )
+    if start_hour > 23 or end_hour > 23 or start_minute > 59 or end_minute > 59:
+        raise ValueError("quiet hours value is invalid")
+    start = start_hour * 60 + start_minute
+    end = end_hour * 60 + end_minute
+    if start == end:
+        raise ValueError("quiet hours range cannot be empty")
+    return start, end
+
+
+def _format_quiet_policy(policy: ProfileReminderPolicy) -> str:
+    if policy.quiet_start_minute is None or policy.quiet_end_minute is None:
+        return "Quiet hours выключены."
+    start = divmod(policy.quiet_start_minute, 60)
+    end = divmod(policy.quiet_end_minute, 60)
+    return (
+        "Quiet hours: "
+        f"{start[0]:02d}:{start[1]:02d}-{end[0]:02d}:{end[1]:02d}."
+    )

@@ -1,6 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
-from lenkobot.action_confirmation import SQLiteActionConfirmationStore
+from lenkobot.action_confirmation import (
+    ActionConfirmationService,
+    ConfirmationOutcome,
+    SQLiteActionConfirmationStore,
+)
 
 
 _START = datetime(2026, 7, 20, 12, 0, 0, tzinfo=timezone.utc)
@@ -130,4 +134,65 @@ def test_store_rejects_invalid_constructor_and_create_arguments(tmp_path):
         pass
     else:
         raise AssertionError("blank action type must be rejected")
+    store.close()
+
+
+def test_resolution_outcome_is_durable_and_same_decision_can_be_recovered(tmp_path):
+    store = build_store(tmp_path, clock=MutableClock())
+    token = store.create(
+        owner_user_id=42,
+        action_type="activate_reminder",
+        payload={"task_id": 7},
+    )
+
+    first = store.resolve(
+        token=token,
+        owner_user_id=42,
+        outcome=ConfirmationOutcome.CONFIRMED,
+    )
+    replay = store.resolve(
+        token=token,
+        owner_user_id=42,
+        outcome=ConfirmationOutcome.CONFIRMED,
+    )
+
+    assert first is not None
+    assert first.first_resolution is True
+    assert first.outcome is ConfirmationOutcome.CONFIRMED
+    assert first.action.payload == {"task_id": 7}
+    assert replay is not None
+    assert replay.first_resolution is False
+    assert replay.action == first.action
+    assert store.resolve(
+        token=token,
+        owner_user_id=42,
+        outcome=ConfirmationOutcome.CANCELLED,
+    ) is None
+    row = store._connection.execute(
+        "SELECT outcome, resolved_at FROM action_confirmation WHERE token = ?",
+        (token,),
+    ).fetchone()
+    assert tuple(row) == ("confirmed", _START.isoformat(timespec="microseconds"))
+    store.close()
+
+
+def test_action_confirmation_service_records_cancellation_without_execution(tmp_path):
+    store = build_store(tmp_path, clock=MutableClock())
+    service = ActionConfirmationService(store)
+    token = service.request(
+        owner_user_id=42,
+        action_type="activate_reminder",
+        payload={"task_id": 7},
+    )
+
+    resolution = service.resolve(
+        token=token,
+        owner_user_id=42,
+        confirmed=False,
+    )
+
+    assert resolution is not None
+    assert resolution.outcome is ConfirmationOutcome.CANCELLED
+    assert resolution.first_resolution is True
+    assert store.consume(token=token, owner_user_id=42) is None
     store.close()
