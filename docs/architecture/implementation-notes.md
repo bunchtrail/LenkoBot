@@ -88,6 +88,7 @@
 - `Assumed`: reminder defaults — timezone `UTC`, quiet hours disabled, grace 3600 seconds, claim lease 60 seconds, максимум три delivery attempts. Owner может менять timezone/quiet policy командами; per-reminder timezone/urgent override сохраняется в draft.
 - `Confirmed`: Telegram transport имеет exactly-once logical outbox, но не exactly-once external send: Bot API не принимает idempotency key. Crash после accepted send до persistence остаётся at-least-once risk; система хранит content-free external-commit audit и не утверждает невозможную гарантию.
 - `Confirmed`: локальный Windows composition root открывает отдельные SQLite connections для reminder application service и scheduler/worker к общему `state.db`. `run_polling` запускает worker внутри lifecycle того же Telegram `Bot`, немедленно останавливает polling при неожиданном завершении worker и отменяет второй task до закрытия клиента; `ResetCoordinator` quiesce-ит старый worker epoch и требует зарегистрированный `tasks` purge hook.
+- `Confirmed`: 22 июля 2026 владелец разрешил публикацию оригинального кода LenkoBot под MIT. Публичное позиционирование остаётся честным: security-first single-owner reference implementation и Windows-first developer preview с локально проверенными reminders, без заявлений о real due-delivery smoke, Linux/Docker production или внешнем adoption.
 
 ## Находки
 
@@ -105,6 +106,7 @@
 - Фактический local `data/state.db` перед Phase 1 имел `user_version = 3` и существующие IDs `conversation=1`, `persona=1`, `persona_session=1`; additive migration создаёт новые session tables без backfill/rewrite этих IDs.
 - Phase 2 verification показала, что extraction provider должен получать только user/assistant pair, а модельный candidate payload нельзя считать trusted: schema validation, evidence-turn allowlist и local deny corpus выполняются до записи.
 - На Windows host отсутствует executable `age`; exporter имеет injected encryptor для tests и fail-closed subprocess boundary. Production runbook должен установить/pin `age` перед включением export UI.
+- GitHub community profile перед OSS-упаковкой имел health score `14%`: отсутствовали root README, license, contributing/security policies и issue templates. Технический CI был зелёным, но публичный контракт установки и сопровождения отсутствовал.
 
 ## Отклонения
 

@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused improvement that fits the project boundary
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user or maintainer problem, not only a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observable behavior
+      description: What should change for the single owner or a contributor?
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and data considerations
+      description: Note new authority, persistence, credentials, network access, or destructive effects.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include a smaller option when one exists.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I reviewed the current roadmap and known limitations.
+          required: true

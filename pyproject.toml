@@ -4,9 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lenkobot"
-version = "0.0.0"
-description = "Personal Telegram companion bot"
+version = "0.1.0"
+description = "Security-first Telegram companion with scoped memory and explicit data controls"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nikita Lolenko" }]
 requires-python = ">=3.13,<3.14"
+keywords = ["ai-agent", "personal-assistant", "security", "telegram"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Security",
+]
 dependencies = [
     "aiogram==3.29.1",
     "ddgs==9.14.4",
@@ -19,9 +32,20 @@ e2e = ["telethon==1.44.0"]
 [project.scripts]
 lenkobot = "lenkobot.runtime:main"
 
+[project.urls]
+Documentation = "https://github.com/bunchtrail/LenkoBot/tree/main/docs"
+Issues = "https://github.com/bunchtrail/LenkoBot/issues"
+Repository = "https://github.com/bunchtrail/LenkoBot"
+
 [dependency-groups]
-dev = ["pytest==8.3.5"]
+dev = [
+    "pytest==8.3.5",
+    "ruff==0.15.22",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
