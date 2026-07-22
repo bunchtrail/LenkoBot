@@ -223,7 +223,7 @@
 - Phase 2.5 runtime foundation red cycles выявили и закрыли два regression gaps: startup recovery test doubles получили новый lane-listing port, а v6 migration начала seed-ить pre-v6 `persona` rows и backfill-ить exact `persona_session.persona_version_id`.
 - Phase 2.5 targeted/schema regression suite после retention и lint tests завершился: `22 passed`; полный suite после изменений: `210 passed`.
 - Retention regression подтверждает, что referenced `persona_version` нельзя удалить через FK, а orphan version сохраняется после удаления lane и повторного открытия базы. Template lint regression покрывает все четыре voice kinds.
-- Phase 2.5 остаётся `in progress` только из-за owner acceptance corpus; коммит не создавался без явного запроса владельца.
+- Phase 2.5 остаётся `in progress` только из-за owner acceptance corpus; voice refinement commit `88e88b9` отправлен в `origin/main`.
 - Acceptance corpus подготовлен в [phase-2.5-voice-corpus.md](../acceptance/phase-2.5-voice-corpus.md); live samples и owner approval ещё не записаны.
 - После Phase 2.5 documentation update `compileall`, `uv lock --check` и `git diff --check` завершились успешно.
 - Ruff `0.15.22` через `uvx --from ruff ruff check src tests` завершился без ошибок.
@@ -239,4 +239,4 @@
 - `Confirmed`: 21 июля 2026 bro identity повышена до `identity_version = 5`: разговорный тон больше не означает имитацию телефонных опечаток, а названия игр, технологий и другие имена собственные должны сохраняться канонически. Для догадок по косвенным признакам добавлено явное маркирование неуверенности; config example и regression test обновлены.
 - `Confirmed`: bro voice повышен до `identity_version = 6`: одиночный thinking-status `сек` заменён циклическим набором `щас вникну`, `дай соображу`, `разбираюсь`, `собираю ответ`. Статусы остаются обычным коротким текстом без Markdown, эмодзи и анимаций.
 - Phase 3 red cycles закрыли typed reminder parser, recurrence/DST policy, task/job/run/outbox stores, restart/retry semantics, application confirmations, Telegram delivery worker, reset fences и production runtime wiring. Связанный adapter/runtime/reminder/reset suite завершился: `105 passed`.
-- Финальная local Phase 3/OSS verification: полный suite `365 passed`; Ruff, `compileall`, `uv lock --check`, `git diff --check` и сборка sdist/wheel успешны. Hosted CI и real Telegram due-delivery smoke остаются pending.
+- Финальная local Phase 3/OSS verification: полный suite `365 passed`; Ruff, `compileall`, `uv lock --check`, `git diff --check` и сборка sdist/wheel успешны. Feature commit `2065f42` и OSS commit `58f7df2` отправлены в `origin/main`; после dependency fix `caddddd` hosted CI run `29931512541` завершил Linux quality/build, Windows tests и migration/security regressions успешно. Real Telegram due-delivery smoke остаётся pending.
