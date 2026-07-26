@@ -46,7 +46,7 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 8
+    assert persona.identity_version == 9
     assert "не копируй ошибки" in persona.identity_prompt
     assert "каноническом виде" in persona.identity_prompt
     assert "не искажай термины" in persona.identity_prompt
@@ -66,7 +66,7 @@ def test_bro_persona_shows_no_thinking_placeholder():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 8
+    assert persona.identity_version == 9
     assert persona.voice.status == ()
 
     assert VoiceRenderer().render(persona, "status", fallback="") == ""
