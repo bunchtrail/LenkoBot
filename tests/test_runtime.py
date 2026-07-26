@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from lenkobot.runtime import (
     login_telegram_e2e,
     main,
     open_local_application,
+    open_oauth_credentials,
     run_application,
     run_local_chat,
     WebSearchSettings,
@@ -21,7 +23,15 @@ from lenkobot.xai_provider import CredentialUnavailable, OAuthTokenState
 from lenkobot.web_search import DdgsWebSearch, WebSearchToolLoop
 
 
-def write_config(tmp_path):
+@pytest.fixture(autouse=True)
+def _never_spawn_codex_binary(monkeypatch):
+    """Startup verification spawns the real Codex CLI; tests must never do that."""
+    import lenkobot.runtime as runtime
+
+    monkeypatch.setattr(runtime, "verify_codex_credentials", lambda: None)
+
+
+def write_config(tmp_path, provider="xai"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     config_path = tmp_path / "lenkobot.toml"
     config_path.write_text(
@@ -42,6 +52,9 @@ client_id = "public-client-id"
 """.strip(),
         encoding="utf-8",
     )
+    if provider is not None:
+        with config_path.open("a", encoding="utf-8") as config_file:
+            config_file.write(f'\n\n[provider]\nname = "{provider}"\n')
     return config_path
 
 
@@ -117,8 +130,11 @@ def test_open_local_application_wires_ddgs_tool_loop(tmp_path, monkeypatch):
     config_path = write_config(tmp_path)
     with config_path.open("a", encoding="utf-8") as config_file:
         config_file.write('\n[web_search]\nprovider = "ddgs"\nmax_results = 4\n')
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (ExistingCredentialStore(), FakeMutex()),
+    )
 
     application = open_local_application(load_runtime_settings(config_path))
     try:
@@ -147,8 +163,11 @@ def test_open_local_application_requires_tavily_key_from_environment(
     config_path = write_config(tmp_path)
     with config_path.open("a", encoding="utf-8") as config_file:
         config_file.write('\n[web_search]\nprovider = "tavily"\n')
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (ExistingCredentialStore(), FakeMutex()),
+    )
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     with pytest.raises(CredentialUnavailable, match="Tavily API key"):
@@ -219,8 +238,11 @@ def test_login_uses_configured_client_and_only_prints_user_visible_data(
             self.completions.append((authorization, store, lock))
             return token_state()
 
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", FakeCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    def fake_credentials(**_):
+        credential_store = FakeCredentialStore()
+        return credential_store, FakeMutex(credential_store.target_name)
+
+    monkeypatch.setattr(runtime, "open_oauth_credentials", fake_credentials)
     monkeypatch.setattr(runtime, "XaiOAuthDeviceClient", FakeDeviceClient)
     output = []
 
@@ -252,7 +274,11 @@ def test_run_fails_before_polling_when_oauth_state_is_missing(tmp_path, monkeypa
     async def polling(*args, **kwargs):
         raise AssertionError("polling must not start")
 
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", MissingCredentialStore)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (MissingCredentialStore(), None),
+    )
 
     with pytest.raises(CredentialUnavailable, match="unavailable"):
         asyncio.run(
@@ -355,8 +381,11 @@ def test_run_composes_oauth_only_service_with_shared_state_database_and_closes_s
         if polling_error is not None:
             raise polling_error
 
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (ExistingCredentialStore(), FakeMutex()),
+    )
     monkeypatch.setattr(runtime, "SQLiteConversationStore", RecordingConversationStore)
     monkeypatch.setattr(runtime, "SQLiteMemoryStore", RecordingMemoryStore)
     monkeypatch.setattr(runtime, "SQLiteSessionStore", RecordingSessionStore)
@@ -432,8 +461,11 @@ def test_local_application_reset_quiesces_worker_and_purges_reminders(
         async def send(self, response):
             return None
 
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (ExistingCredentialStore(), FakeMutex()),
+    )
     monkeypatch.setattr(runtime, "XaiStructuredProvider", FakeStructuredProvider)
     settings = load_runtime_settings(write_config(tmp_path))
     application = open_local_application(settings)
@@ -816,8 +848,11 @@ def test_chat_composes_oauth_only_service_and_preserves_conversation_across_invo
         def respond(self, prompt, *, schema_name, schema):
             return SimpleNamespace(value={"candidates": []})
 
-    monkeypatch.setattr(runtime, "WindowsOAuthCredentialStore", ExistingCredentialStore)
-    monkeypatch.setattr(runtime, "WindowsOAuthRefreshMutex", FakeMutex)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (ExistingCredentialStore(), FakeMutex()),
+    )
     monkeypatch.setattr(runtime, "XaiProvider", FakeProvider)
     monkeypatch.setattr(runtime, "XaiStructuredProvider", FakeStructuredProvider)
     config_path = write_config(tmp_path)
@@ -867,3 +902,100 @@ def test_main_runs_chat_with_explicit_data_root(tmp_path, monkeypatch):
     assert result == 0
     assert observed["settings"].data_root == data_root
     assert observed["message"] == "hello"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows credential backend")
+def test_open_oauth_credentials_selects_windows_backend():
+    from lenkobot.oauth_credentials import (
+        WindowsOAuthCredentialStore,
+        WindowsOAuthRefreshMutex,
+    )
+
+    store, lock = open_oauth_credentials(platform="win32")
+
+    assert isinstance(store, WindowsOAuthCredentialStore)
+    assert isinstance(lock, WindowsOAuthRefreshMutex)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX credential backend")
+def test_open_oauth_credentials_selects_protected_file_backend():
+    from lenkobot.linux_oauth_credentials import (
+        LinuxOAuthCredentialStore,
+        LinuxOAuthRefreshLock,
+        linux_credential_path,
+    )
+
+    store, lock = open_oauth_credentials(platform="linux")
+
+    assert isinstance(store, LinuxOAuthCredentialStore)
+    assert isinstance(lock, LinuxOAuthRefreshLock)
+    assert store.path == linux_credential_path()
+
+
+def test_runtime_settings_default_to_codex_provider(tmp_path):
+    config_path = write_config(tmp_path, provider=None)
+
+    assert load_runtime_settings(config_path).model_provider == "codex"
+
+
+def test_runtime_settings_accept_explicit_xai_provider(tmp_path):
+    assert load_runtime_settings(write_config(tmp_path)).model_provider == "xai"
+
+
+def test_runtime_settings_reject_unknown_provider(tmp_path):
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write('\n[provider]\nname = "anthropic"\n')
+
+    with pytest.raises(ValueError, match="provider"):
+        load_runtime_settings(config_path)
+
+
+def test_open_local_application_uses_codex_without_xai_oauth_state(tmp_path, monkeypatch):
+    import lenkobot.runtime as runtime
+    from lenkobot.codex_provider import CodexProvider
+
+    def refuse_credentials(**_):
+        raise AssertionError("codex path must not require xAI OAuth state")
+
+    monkeypatch.setattr(runtime, "open_oauth_credentials", refuse_credentials)
+
+    config_path = write_config(tmp_path, provider="codex")
+    application = open_local_application(load_runtime_settings(config_path))
+    try:
+        assert isinstance(application.service._provider, CodexProvider)
+    finally:
+        application.close()
+
+
+def test_open_local_application_rejects_web_search_on_codex_provider(tmp_path):
+    config_path = write_config(tmp_path, provider="codex")
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write('\n[web_search]\nprovider = "ddgs"\n')
+
+    with pytest.raises(ValueError, match="web search"):
+        open_local_application(load_runtime_settings(config_path))
+
+
+def test_login_uses_codex_device_code_flow(tmp_path, monkeypatch):
+    import lenkobot.runtime as runtime
+
+    observed = {}
+
+    def fake_login(*, output):
+        observed["called"] = True
+        output("Open: https://example.test/activate")
+
+    monkeypatch.setattr(runtime, "codex_device_login", fake_login)
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (_ for _ in ()).throw(AssertionError("xAI login must not run")),
+    )
+    output = []
+
+    settings = load_runtime_settings(write_config(tmp_path, provider="codex"))
+    login(settings, output=output.append)
+
+    assert observed["called"] is True
+    assert output == ["Open: https://example.test/activate"]

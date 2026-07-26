@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from getpass import getpass
 import os
 from pathlib import Path
+import sys
 import tomllib
 
 from .aiogram_adapter import (
@@ -21,6 +22,19 @@ from .action_confirmation import (
 from .application_service import TelegramApplicationService
 from .context_builder import ContextBuilder
 from .live_smoke import run_live_smoke
+from .linux_oauth_credentials import (
+    LinuxOAuthCredentialStore,
+    LinuxOAuthRefreshLock,
+    linux_credential_path,
+)
+from .codex_provider import (
+    CODEX_MODEL,
+    CodexProvider,
+    CodexStructuredProvider,
+    SdkCodexThreadRunner,
+    codex_device_login,
+    verify_codex_credentials,
+)
 from .memory import SQLiteMemoryStore
 from .memory_extraction import ExtractionCoordinator, MemoryExtractionService
 from .oauth_credentials import (
@@ -91,6 +105,7 @@ class RuntimeSettings:
     web_search: WebSearchSettings | None = None
     export_recipient: str | None = None
     config_path: Path | None = None
+    model_provider: str = "codex"
 
 
 class _DiscardingReplyPort:
@@ -166,6 +181,13 @@ def load_runtime_settings(
             max_results=max_results,
         )
 
+    provider_table = data.get("provider", {})
+    if not isinstance(provider_table, dict):
+        raise ValueError("provider configuration is invalid")
+    model_provider = provider_table.get("name", "codex")
+    if model_provider not in ("codex", "xai"):
+        raise ValueError("provider name must be 'codex' or 'xai'")
+
     try:
         persona_catalog = PersonaCatalog.from_toml(path)
     except (KeyError, TypeError, ValueError) as error:
@@ -180,7 +202,21 @@ def load_runtime_settings(
         web_search=web_search_settings,
         export_recipient=export_recipient,
         config_path=path,
+        model_provider=model_provider,
     )
+
+
+def open_oauth_credentials(*, platform: str = sys.platform):
+    """Select the credential backend that owns rotating OAuth state.
+
+    Windows keeps state in Credential Manager; every other supported platform
+    uses a service-owned `0600` file with an advisory refresh lock.
+    """
+    if platform == "win32":
+        windows_store = WindowsOAuthCredentialStore()
+        return windows_store, WindowsOAuthRefreshMutex(windows_store.target_name)
+    store = LinuxOAuthCredentialStore(path=linux_credential_path())
+    return store, LinuxOAuthRefreshLock(store.path)
 
 
 def login(
@@ -188,8 +224,10 @@ def login(
     *,
     output: Callable[[str], None] = print,
 ) -> None:
-    store = WindowsOAuthCredentialStore()
-    lock = WindowsOAuthRefreshMutex(store.target_name)
+    if settings.model_provider == "codex":
+        codex_device_login(output=output)
+        return
+    store, lock = open_oauth_credentials()
     client = XaiOAuthDeviceClient(client_id=settings.oauth_client_id)
     authorization = client.start_device_authorization()
     output(f"Open: {authorization.verification_uri}")
@@ -271,12 +309,19 @@ class LocalApplication:
         self._conversation_store.close()
 
 
-def open_local_application(settings: RuntimeSettings) -> LocalApplication:
-    store = WindowsOAuthCredentialStore()
+def _build_providers(settings: RuntimeSettings):
+    """Compose the inference providers for the configured model backend."""
+    if settings.model_provider == "codex":
+        verify_codex_credentials()
+        runner = SdkCodexThreadRunner()
+        return (
+            CodexProvider(runner, model=CODEX_MODEL),
+            CodexStructuredProvider(runner, model=CODEX_MODEL),
+        )
+    store, lock = open_oauth_credentials()
     if store.load() is None:
         raise CredentialUnavailable("OAuth credential state is unavailable")
 
-    lock = WindowsOAuthRefreshMutex(store.target_name)
     coordinator = OAuthRefreshCoordinator(
         store,
         XaiOAuthRefreshClient(client_id=settings.oauth_client_id),
@@ -284,14 +329,30 @@ def open_local_application(settings: RuntimeSettings) -> LocalApplication:
     )
     transport = XaiResponsesTransport()
     oauth_source = OAuthCredentialSource(coordinator, base_url=_INFERENCE_BASE_URL)
-    provider = XaiProvider(
-        transport,
-        CredentialPolicy.OAUTH_ONLY,
-        oauth_source=oauth_source,
-        model=_MODEL,
+    return (
+        XaiProvider(
+            transport,
+            CredentialPolicy.OAUTH_ONLY,
+            oauth_source=oauth_source,
+            model=_MODEL,
+        ),
+        XaiStructuredProvider(
+            transport,
+            oauth_source=oauth_source,
+            model=_MODEL,
+        ),
     )
+
+
+def open_local_application(settings: RuntimeSettings) -> LocalApplication:
+    provider, structured_provider = _build_providers(settings)
     tool_loop = None
     if settings.web_search is not None:
+        if not provider.supports_tools:
+            raise ValueError(
+                "web search requires a provider with tool support; "
+                "the codex backend does not expose one"
+            )
         if settings.web_search.provider == "ddgs":
             search = DdgsWebSearch(max_results=settings.web_search.max_results)
         else:
@@ -303,11 +364,6 @@ def open_local_application(settings: RuntimeSettings) -> LocalApplication:
                 max_results=settings.web_search.max_results,
             )
         tool_loop = WebSearchToolLoop(provider, search)
-    structured_provider = XaiStructuredProvider(
-        transport,
-        oauth_source=oauth_source,
-        model=_MODEL,
-    )
 
     settings.data_root.mkdir(parents=True, exist_ok=True)
     database_path = settings.data_root / "state.db"

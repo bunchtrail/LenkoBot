@@ -10,9 +10,12 @@ voice = { status = ["Thinking."], notice = ["{text}"], command = ["{text}"], err
 [telegram]
 allowed_user_id = 123456789
 
+# "codex" runs gpt-5.6-luna over a Codex/ChatGPT subscription; run
+# `lenkobot login` once to sign in. Switch to "xai" for the legacy grok-4.5
+# OAuth path, which is also the only backend that supports [web_search].
+[provider]
+name = "codex"
+
+# Only read by the "xai" backend.
 [oauth]
 client_id = "b1a00492-073a-47ea-816f-4c329264a828"
-
-[web_search]
-provider = "ddgs"
-max_results = 5

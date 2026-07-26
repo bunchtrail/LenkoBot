@@ -44,7 +44,10 @@ These patterns are useful independently of the default persona or model.
   `/quiet`, `/remember`, `/memories`, and `/forget`.
 - Editable status-to-final responses, safe message splitting, pagination, and
   replay-resistant confirmation callbacks.
-- OAuth-only xAI Responses integration for `grok-4.5`.
+- `gpt-5.6-luna` over a Codex/ChatGPT subscription, with headless device-code
+  sign-in, an isolated `CODEX_HOME`, and every turn pinned to a read-only,
+  approval-denying ephemeral thread. The legacy OAuth-only xAI `grok-4.5` path
+  stays available behind `[provider] name = "xai"`.
 - Optional model-directed web search through DDGS or Tavily with source links.
 - Unit, integration, migration, concurrency, and security regression coverage.
 
@@ -86,7 +89,12 @@ boundaries. The detailed contracts live in the
 - Windows 10 or 11.
 - Python `3.13` and [uv](https://docs.astral.sh/uv/).
 - A Telegram bot token and the numeric Telegram user ID of its sole owner.
-- An xAI account with compatible OAuth model access.
+- A Codex/ChatGPT subscription for the default `codex` backend, or an xAI
+  account with compatible OAuth model access for `[provider] name = "xai"`.
+
+The Codex backend talks to a subscription endpoint that OpenAI does not
+document, and the bundled Codex CLI can fall behind it. Point
+`LENKOBOT_CODEX_BIN` at a newer `codex` binary if requests start failing.
 
 The example config contains the public OAuth client ID used by the upstream
 Hermes reference. LenkoBot does not own that client ID and cannot guarantee its

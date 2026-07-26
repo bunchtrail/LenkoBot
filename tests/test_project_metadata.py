@@ -43,4 +43,7 @@ def test_public_minimal_config_is_loadable():
 
     assert settings.allowed_user_id == 123456789
     assert settings.persona_catalog.default_persona_key == "companion"
-    assert settings.web_search is not None
+    # The published quick-start config must start on the default backend, and
+    # the codex backend exposes no search tool, so it ships without web search.
+    assert settings.model_provider == "codex"
+    assert settings.web_search is None
