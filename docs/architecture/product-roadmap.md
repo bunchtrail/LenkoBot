@@ -67,7 +67,7 @@ LenkoBot считается завершённым, когда выполняю�
 | Автономность | Бот предлагает действие; запись, запуск и внешние изменения требуют подтверждения |
 | Runtime | Windows-first для разработки и аварийного запуска; Linux VPS для production |
 | Deploy | Docker Compose; отдельный sandbox worker; Cloudflare Tunnel для панели |
-| AI | Только xAI для model inference; текущий OAuth path сохраняется, платный provider fallback не добавляется |
+| AI | `gpt-5.6-luna` через подписочный OAuth Codex и официальный SDK `openai-codex`; платный API-key fallback не добавляется. Прежнее ограничение «только xAI» отменено владельцем 26 июля 2026, см. [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md) |
 | Входящие и ответы | Только текст в целевой версии; media/STT/TTS не входят в scope |
 | Персоны | Web CRUD с versioning; изменение identity не переписывает старые session lanes |
 | Transcript | Только активная сессия; закрытие только явной командой; после закрытия raw turns удаляются |
@@ -823,8 +823,13 @@ Credential Manager checks выполняются в защищённом environ
 Это не скрытые продуктовые решения; каждый пункт должен получить evidence и быть
 зафиксирован в `implementation-notes.md` до реализации зависимой фазы:
 
-1. Подтвердить долгосрочную совместимость xAI OAuth bearer с direct
-   `https://api.x.ai/v1`, rotation semantics и controlled error classification.
+1. `Closed` 27 июля 2026: выбран провайдер model inference — `gpt-5.6-luna`
+   через официальный SDK `openai-codex` на подписочном OAuth. Контракт, источники
+   и отвергнутая альтернатива зафиксированы в
+   [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md). Остаются
+   открытыми до реализации: достаточность `Sandbox.read_only` для запрета shell,
+   приоритет `base_instructions`/`developer_instructions`, форма событий
+   `stream()` и классификация ошибок квоты подписки.
 2. Выбрать web search provider без новых постоянных расходов; проверить terms,
    rate limits, source fidelity и citation metadata. Если такой provider не
    найден, выпустить URL/manual knowledge first и оставить search feature gate.

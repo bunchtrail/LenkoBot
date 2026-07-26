@@ -19,7 +19,7 @@ Roadmap определяет целевой контракт и порядок �
 - размер checkbox-задач различается, поэтому процент по числу галочек не
   используется как оценка готовности.
 
-Последняя сверка: **22 июля 2026**.
+Последняя сверка: **26 июля 2026**.
 
 Текущий этап: **Phase 2 complete; Phase 0 MTProto E2E setup blocker remains
 explicitly accepted; Phase 2.5 owner acceptance remains open; Phase 3 and its
@@ -550,11 +550,11 @@ Roadmap: [Phase 8](product-roadmap.md#phase-8-linux-oauth-и-docker-compose-prod
 
 ### Работы
 
-- [ ] Закрыть Linux protected-file OAuth research gate.
-- [ ] Реализовать dedicated-service-UID `0600` credential file.
-- [ ] Добавить lock, validation, `fsync`, atomic replace и directory sync.
-- [ ] Добавить owner/mode/symlink fail-closed checks.
-- [ ] Сохранить Windows Credential Manager backend.
+- [x] Закрыть Linux protected-file OAuth research gate.
+- [x] Реализовать dedicated-service-UID `0600` credential file.
+- [x] Добавить lock, validation, `fsync`, atomic replace и directory sync.
+- [x] Добавить owner/mode/symlink fail-closed checks.
+- [x] Сохранить Windows Credential Manager backend.
 - [ ] Собрать Compose `app` service.
 - [ ] Собрать Compose `worker` service.
 - [ ] Подключить isolated sandbox runner/service.
@@ -564,9 +564,13 @@ Roadmap: [Phase 8](product-roadmap.md#phase-8-linux-oauth-и-docker-compose-prod
 - [ ] Включить и проверить SQLite WAL/cross-process coordination.
 - [ ] Добавить health/readiness и graceful shutdown.
 - [ ] Добавить restart policy.
-- [ ] Инжектировать Telegram secret вне image/config repository.
+- [x] Инжектировать Telegram secret вне image/config repository.
+  Evidence: `EnvironmentFile=/etc/lenkobot/lenkobot.env` с режимом `0640`
+  `root:lenkobot`; в `config.toml` и репозитории токена нет.
 - [ ] Проверить OS/volume encryption prerequisite.
-- [ ] Описать manual deploy.
+- [x] Описать manual deploy.
+  Evidence: [vps-deploy.md](../runbooks/vps-deploy.md); systemd-путь для текущего
+  состояния кода, Compose остаётся целью вместе с Phase 6/7.
 - [ ] Описать schema-compatible rollback и forward recovery.
 - [ ] Не добавлять automatic backup/replication/paid observability.
 
@@ -588,7 +592,20 @@ Roadmap: [Phase 8](product-roadmap.md#phase-8-linux-oauth-и-docker-compose-prod
 ### Evidence
 
 - Commit: `pending`
-- Linux credential tests: `pending`
+- Linux credential tests: `18 targeted passed` (2 POSIX-only skipped on Windows,
+  исполняются на Linux CI); полный suite `401 passed, 3 skipped`
+- Real POSIX proof: WSL Ubuntu, нативная ext4, 26 июля 2026 — mode `0o600`,
+  отказ `0o644`, отказ symlink (`O_NOFOLLOW`), atomic replace без temp-остатков,
+  `flock` contention/release; под `uid=0` дополнительно foreign-owner rejection.
+  `failures=0`
+- Linux run-path proof 27 июля 2026: полный suite на Linux `428 passed,
+  1 skipped`; выбран `LinuxOAuthCredentialStore`/`LinuxOAuthRefreshLock`;
+  headless device-code логин стартует и отменяется; `lenkobot run` без
+  учётных данных отказывает безопасным сообщением
+- Deployment artefacts: [lenkobot.service](../../deploy/lenkobot.service)
+  (проверен `systemd-analyze verify`),
+  [lenkobot.env.example](../../deploy/lenkobot.env.example),
+  [vps-deploy.md](../runbooks/vps-deploy.md)
 - Compose smoke: `pending`
 - VPS deploy: `pending`
 - Restart/recovery drill: `pending`
@@ -648,13 +665,17 @@ Roadmap: [Phase 9](product-roadmap.md#phase-9-production-hardening-и-release)
 
 Roadmap: [Open research gates](product-roadmap.md#open-research-gates)
 
-- [ ] Подтвердить xAI OAuth inference/rotation/error contract.
+- [x] Выбрать провайдер model inference и подтвердить его контракт.
+  Evidence: [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md) —
+  `gpt-5.6-luna` через официальный SDK `openai-codex` `0.144.4` на подписочном
+  OAuth; device-code логин, `output_schema`, `stream()` и типизированные ошибки
+  подтверждены по официальному api-reference.
 - [ ] Выбрать web search source без новых постоянных расходов.
 - [ ] Проверить Telegram Login и Cloudflare Tunnel contract.
 - [ ] Выбрать и проверить narrow rootless sandbox runner.
 - [x] Выбрать proven recurrence/DST implementation.
 - [ ] Выбрать encrypted export format и key lifecycle.
-- [ ] Проверить Linux protected-file OAuth backend.
+- [x] Проверить Linux protected-file OAuth backend.
 - [ ] Измерить summary и automatic-memory quality/cost corpus.
 
 Для каждого закрытого research gate:
@@ -665,6 +686,48 @@ Roadmap: [Open research gates](product-roadmap.md#open-research-gates)
 - [ ] Обновить `Confirmed`/`Assumed`/`Open` в roadmap.
 - [ ] Добавить regression/acceptance test, если решение задаёт observable
   contract.
+
+## Провайдер model inference (Codex / gpt-5.6-luna)
+
+Roadmap: подтверждённая целевая граница, строка `AI`.
+Research: [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md)
+
+### Работы
+
+- [x] Закрыть research gate провайдера с источниками и уровнями доверия.
+- [x] Добавить зависимость `openai-codex` и зафиксировать её в lock.
+- [x] Реализовать `CodexProvider` для текстового ответа.
+- [x] Реализовать `CodexStructuredProvider` для extraction/summary/reminder схем.
+- [x] Закрепить минимальные полномочия: ephemeral thread, `Sandbox.read_only`,
+  `ApprovalMode.deny_all`.
+- [x] Изолировать `CODEX_HOME` от интерактивного конфига оператора.
+- [x] Добавить headless device-code логин в `lenkobot login`.
+- [x] Добавить startup preflight, который падает закрыто без входа в аккаунт.
+- [x] Сделать выбор бэкенда конфигурируемым (`[provider] name`), сохранив xAI.
+- [x] Fail-closed при `[web_search]` на бэкенде без поддержки инструментов.
+- [ ] Живой inference-smoke `gpt-5.6-luna` через LenkoBot.
+  - Blocker: требуется однократный `lenkobot login` в изолированный
+    `CODEX_HOME`; токен оператора намеренно не копировался.
+- [ ] Перенести web search на нативные инструменты Codex.
+
+### Exit gates
+
+- [x] SDK-типы не покидают `codex_provider`.
+- [x] Полномочия закреплены значениями настоящего SDK-enum, а не подделками.
+- [x] Ошибки провайдера не раскрывают исходный текст и токены.
+- [x] Неавторизованное состояние останавливает старт.
+- [ ] Реальный ответ модели получен через Telegram-путь.
+
+### Evidence
+
+- Targeted tests: `19 passed` (`test_codex_provider.py`); полный suite
+  `426 passed, 3 skipped`; Ruff, `compileall`, `uv lock --check` успешны
+- Контракт SDK подтверждён интроспекцией установленного пакета `0.144.4`
+- Live-находка 27 июля 2026: bundled `openai-codex-cli-bin 0.144.4` отклоняется
+  бэкендом (`reasoning.context` must be `all_turns`) на всех конфигурациях,
+  включая модель по умолчанию; локальный `codex-cli 0.145.0` проходит эту стадию
+- Fail-closed изоляции проверен реальным бинарником на пустом `CODEX_HOME`
+- Commit: `pending`
 
 ## Deferred после Personal Production
 
