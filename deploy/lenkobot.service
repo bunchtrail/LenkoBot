@@ -1,0 +1,66 @@
+[Unit]
+Description=LenkoBot personal Telegram companion
+Documentation=https://github.com/bunchtrail/LenkoBot
+After=network-online.target
+Wants=network-online.target
+# Long polling reconnects on its own; never give up after transient outages.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=lenkobot
+Group=lenkobot
+WorkingDirectory=/opt/lenkobot
+
+# TELEGRAM_BOT_TOKEN lives here, never in config.toml or the repository.
+# Create it with mode 0600 owned by root:lenkobot.
+EnvironmentFile=/etc/lenkobot/lenkobot.env
+
+# The bundled Codex CLI can fall behind the live subscription backend; point
+# this at a newer `codex` binary when inference starts failing.
+Environment=LENKOBOT_CODEX_HOME=/var/lib/lenkobot/codex
+Environment=LENKOBOT_CODEX_BIN=/usr/bin/codex
+
+# --data-root is explicit: it defaults next to config.toml, and /etc is
+# read-only under ProtectSystem=strict.
+ExecStart=/opt/lenkobot/.venv/bin/lenkobot run \
+    --config /etc/lenkobot/config.toml \
+    --data-root /var/lib/lenkobot/data
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# Filesystem isolation. The service may only write its own state.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ReadWritePaths=/var/lib/lenkobot
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Sized for a 1.5 GB host. MemoryHigh throttles before the kernel kills the
+# process; raise both if turns start stalling under memory pressure.
+MemoryHigh=512M
+MemoryMax=900M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lenkobot
+
+[Install]
+WantedBy=multi-user.target
