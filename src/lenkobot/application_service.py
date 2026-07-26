@@ -380,25 +380,28 @@ class TelegramApplicationService:
                     )
                 )
                 return None
-        try:
-            status_handle = await presenter.send(
-                    TelegramResponse(
-                        chat_id=turn.chat_id,
-                        kind=TelegramResponseKind.STATUS,
-                        text=self._voice(
-                            persona,
-                            "status",
-                            "Готовлю ответ",
-                        ),
-                    )
-            )
-        except Exception:
-            self._record_transcript_failure(
-                user_turn,
-                FailureStage.DELIVERY,
-                "telegram_status_delivery_failed",
-            )
-            raise
+        # An empty status voice collection means the persona wants no
+        # placeholder at all: Telegram already shows its own typing indicator,
+        # so the answer arrives as the only message. Downstream delivery treats
+        # a missing handle as "send a new message".
+        status_text = self._voice(persona, "status", "")
+        status_handle = None
+        if status_text:
+            try:
+                status_handle = await presenter.send(
+                        TelegramResponse(
+                            chat_id=turn.chat_id,
+                            kind=TelegramResponseKind.STATUS,
+                            text=status_text,
+                        )
+                )
+            except Exception:
+                self._record_transcript_failure(
+                    user_turn,
+                    FailureStage.DELIVERY,
+                    "telegram_status_delivery_failed",
+                )
+                raise
 
         sources = ()
         try:

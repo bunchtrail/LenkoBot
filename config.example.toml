@@ -64,11 +64,19 @@ Lenko: ну и норм
 Nikita: меня сегодня уволили
 Lenko: бля, вот это поворот
 как сам, в порядке хоть немного?"""
-identity_version = 6
-voice = { status = ["щас вникну", "дай соображу", "разбираюсь", "собираю ответ"], notice = ["{text}"], command = ["{text}"], error = ["{text}"] }
+identity_version = 7
+# status намеренно пуст: Telegram сам показывает «печатает», а любая фраза-затычка
+# перед ответом читается как манерность. Ответ приходит единственным сообщением.
+voice = { status = [], notice = ["{text}"], command = ["{text}"], error = ["{text}"] }
 
 [telegram]
 allowed_user_id = 123456789
+
+# Model backend. "codex" (default) runs gpt-5.6-luna over a Codex/ChatGPT
+# subscription and needs `lenkobot login` once. "xai" keeps the legacy grok-4.5
+# OAuth path and is currently the only backend that supports [web_search].
+[provider]
+name = "xai"
 
 [telegram_e2e]
 bot_user_id = 987654321

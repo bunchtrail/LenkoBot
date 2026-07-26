@@ -165,14 +165,16 @@ def build_catalog(tmp_path):
         [[personas]]
         key = "companion"
         display_name = "Companion"
-        identity_prompt = "A calm companion."
+        identity_prompt = "A calm companion. Avoid canned robotic phrasing."
         identity_version = 1
+        voice = { status = ["Готовлю ответ"] }
 
         [[personas]]
         key = "analyst"
         display_name = "Analyst"
-        identity_prompt = "A precise analyst."
+        identity_prompt = "A precise analyst. Avoid canned robotic phrasing."
         identity_version = 1
+        voice = { status = ["Готовлю ответ"] }
         """,
         encoding="utf-8",
     )
@@ -247,7 +249,8 @@ def test_text_turn_uses_active_persona_and_presents_status_then_final(tmp_path):
 
     assert result.text == "Hello from the companion"
     assert provider.prompts == [
-        "A calm companion.\n\nUser message:\nTell me something"
+        "A calm companion. Avoid canned robotic phrasing."
+        "\n\nUser message:\nTell me something"
     ]
     assert [(item.kind, item.text) for item in response_port.responses] == [
         (TelegramResponseKind.STATUS, "Готовлю ответ"),
@@ -286,7 +289,8 @@ def test_web_search_edits_status_and_sends_linked_sources(tmp_path):
     assert result.text == "сейчас доллар стоит 80 рублей"
     assert provider.prompts == []
     assert tool_loop.prompts == [
-        "A calm companion.\n\nUser message:\nпочём доллар?"
+        "A calm companion. Avoid canned robotic phrasing."
+        "\n\nUser message:\nпочём доллар?"
     ]
     assert response_port.responses[0].kind is TelegramResponseKind.STATUS
     assert response_port.edits[0][1].kind is TelegramResponseKind.STATUS
@@ -550,7 +554,10 @@ def test_persona_command_switches_lane_without_provider_call(tmp_path):
     assert command_result is None
     assert text_result.text == "Analyst answer"
     assert len(provider.prompts) == 1
-    assert provider.prompts[0] == "A precise analyst.\n\nUser message:\nAnalyze this"
+    assert provider.prompts[0] == (
+        "A precise analyst. Avoid canned robotic phrasing."
+        "\n\nUser message:\nAnalyze this"
+    )
     assert response_port.responses[0].kind is TelegramResponseKind.FINAL
     assert response_port.responses[0].text == "Персона переключена: Analyst."
     assert router.route(telegram_message("check")).persona_key == "analyst"
@@ -1520,3 +1527,63 @@ def test_new_and_forget_are_unavailable_without_confirmation_store(tmp_path):
     assert response_port.responses[-2].text == "Подтверждения сейчас недоступны."
     assert response_port.responses[-1].text == "Подтверждения сейчас недоступны."
     assert memory_store.get(record.id, user_id=42) is not None
+
+
+def silent_status_catalog(tmp_path):
+    config_path = tmp_path / "silent-personas.toml"
+    config_path.write_text(
+        """
+        default_persona_key = "companion"
+
+        [[personas]]
+        key = "companion"
+        display_name = "Companion"
+        identity_prompt = "A calm companion."
+        identity_version = 2
+        voice = { status = [] }
+        """,
+        encoding="utf-8",
+    )
+    return PersonaCatalog.from_toml(config_path)
+
+
+def test_persona_without_status_voice_sends_no_placeholder_message(tmp_path):
+    """An empty status collection means silence, not a canned placeholder.
+
+    Telegram already shows its own typing indicator, so the answer should
+    arrive as the only message the owner sees.
+    """
+    provider = RecordingProvider(
+        result=XaiTextResponse(
+            response_id="resp-1",
+            model="gpt-5.6-luna",
+            text="да норм",
+            credential_source="codex_oauth",
+        )
+    )
+    response_port = EditableRecordingPort()
+    catalog = silent_status_catalog(tmp_path)
+    router = TelegramRouter(
+        allowed_user_id=42,
+        store=SQLiteConversationStore(tmp_path / "state.db"),
+        reply_port=RecordingResponsePort(),
+        persona_catalog=catalog,
+    )
+    service = TelegramApplicationService(
+        router=router,
+        persona_catalog=catalog,
+        provider=provider,
+        response_port=response_port,
+        context_builder=None,
+        memory_store=None,
+        session_store=None,
+    )
+
+    result = asyncio.run(service.handle(telegram_message("привет")))
+
+    assert result.text == "да норм"
+    assert [response.kind for response in response_port.responses] == [
+        TelegramResponseKind.FINAL
+    ]
+    assert response_port.responses[0].text == "да норм"
+    assert response_port.edits == []

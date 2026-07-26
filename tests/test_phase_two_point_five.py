@@ -46,7 +46,7 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 6
+    assert persona.identity_version == 7
     assert "не копируй ошибки" in persona.identity_prompt
     assert "каноническом виде" in persona.identity_prompt
     assert "не искажай термины" in persona.identity_prompt
@@ -54,27 +54,22 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     assert "печатал с телефона" in persona.identity_prompt
 
 
-def test_bro_status_voice_rotates_plain_short_phrases():
+def test_bro_persona_shows_no_thinking_placeholder():
+    """Owner reversed the version 6 rotating status phrases on 27 July 2026.
+
+    Telegram already shows a typing indicator, so any filler line before the
+    answer reads as affectation. An empty collection must render as empty and
+    must not fall back to a canned placeholder.
+    """
     persona = PersonaCatalog.from_toml(
         Path(__file__).parents[1] / "config.example.toml"
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 6
-    assert persona.voice.status == (
-        "щас вникну",
-        "дай соображу",
-        "разбираюсь",
-        "собираю ответ",
-    )
+    assert persona.identity_version == 7
+    assert persona.voice.status == ()
 
-    renderer = VoiceRenderer()
-    rendered = tuple(
-        renderer.render(persona, "status", fallback="Готовлю ответ")
-        for _ in persona.voice.status
-    )
-
-    assert rendered == persona.voice.status
+    assert VoiceRenderer().render(persona, "status", fallback="") == ""
 
 
 class RecordingResponsePort:
