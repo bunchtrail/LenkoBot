@@ -28,7 +28,6 @@ from .linux_oauth_credentials import (
     linux_credential_path,
 )
 from .codex_provider import (
-    CODEX_CHAT_MODEL,
     CODEX_MODEL,
     CodexProvider,
     CodexStructuredProvider,
@@ -107,7 +106,7 @@ class RuntimeSettings:
     export_recipient: str | None = None
     config_path: Path | None = None
     model_provider: str = "codex"
-    codex_chat_model: str = CODEX_CHAT_MODEL
+    codex_chat_model: str = CODEX_MODEL
     codex_structured_model: str = CODEX_MODEL
 
 
@@ -190,7 +189,7 @@ def load_runtime_settings(
     model_provider = provider_table.get("name", "codex")
     if model_provider not in ("codex", "xai"):
         raise ValueError("provider name must be 'codex' or 'xai'")
-    codex_chat_model = provider_table.get("chat_model", CODEX_CHAT_MODEL)
+    codex_chat_model = provider_table.get("chat_model", CODEX_MODEL)
     codex_structured_model = provider_table.get("structured_model", CODEX_MODEL)
     for label, value in (
         ("chat_model", codex_chat_model),

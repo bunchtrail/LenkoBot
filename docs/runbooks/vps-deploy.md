@@ -25,11 +25,15 @@
 - изолированный `CODEX_HOME` и fail-closed preflight без входа в аккаунт;
 - headless device-code логин стартует и корректно отменяется.
 
-Не проверено и остаётся риском первого запуска:
+Проверено на боевом VPS 27 июля 2026: служба переживает `systemctl restart` без
+падений, держит соединение с Telegram, `gpt-5.6-terra` отвечает в полном
+пайплайне, а схемы памяти и summary разбираются.
 
-- реальный ответ модели через Telegram (нужен однократный `lenkobot login`);
+Не проверено и остаётся риском:
+
 - поведение под нагрузкой и долгий uptime;
-- восстановление после перезагрузки VPS.
+- восстановление после перезагрузки самого VPS;
+- доставка реального напоминания по расписанию.
 
 ## Предварительные требования
 
@@ -118,7 +122,7 @@ sudo nano /etc/lenkobot/config.toml
 ```
 
 Обязательно поменяйте `telegram.allowed_user_id` на свой числовой ID. Оставьте
-`[provider] name = "codex"` — это путь `gpt-5.6-luna` по подписке. Токенов в
+`[provider] name = "codex"` — это путь `gpt-5.6-terra` по подписке. Токенов в
 этом файле быть не должно.
 
 Если включаете `[web_search]`, придётся переключиться на `name = "xai"`:
@@ -141,7 +145,7 @@ sudo chmod 0640 /etc/lenkobot/lenkobot.env
 
 ```bash
 sudo -u lenkobot LENKOBOT_CODEX_HOME=/var/lib/lenkobot/codex \
-     LENKOBOT_CODEX_BIN=/usr/lib/node_modules/@openai/codex/bin/codex \
+     LENKOBOT_CODEX_BIN=/usr/bin/codex \
      /opt/lenkobot/.venv/bin/lenkobot login --config /etc/lenkobot/config.toml
 ```
 

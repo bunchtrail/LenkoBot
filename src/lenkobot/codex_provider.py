@@ -22,12 +22,11 @@ from .xai_provider import (
 )
 
 
-CODEX_MODEL = "gpt-5.6-luna"
-# Chat defaults to the stronger tier: on live probes luna kept emitting
-# corrupted tokens in casual Russian and ignored the persona's anti-formula
-# bans, while terra followed both. Structured calls stay on luna because the
-# output schema constrains them.
-CODEX_CHAT_MODEL = "gpt-5.6-terra"
+# Terra everywhere: luna emitted corrupted tokens in casual Russian and ignored
+# the persona's anti-formula bans, and terra parses the same output schemas, so
+# there is no tier worth the quality gap. `[provider] chat_model` and
+# `structured_model` still allow splitting the tiers to save subscription quota.
+CODEX_MODEL = "gpt-5.6-terra"
 CREDENTIAL_SOURCE = "codex_oauth"
 _MAX_PROMPT_CHARS = 400_000
 _UNTRUSTED_HEADER = (

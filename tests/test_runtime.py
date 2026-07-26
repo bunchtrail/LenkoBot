@@ -1001,11 +1001,11 @@ def test_login_uses_codex_device_code_flow(tmp_path, monkeypatch):
     assert output == ["Open: https://example.test/activate"]
 
 
-def test_codex_models_default_to_terra_chat_and_luna_structured(tmp_path):
+def test_codex_defaults_to_terra_for_chat_and_structured_calls(tmp_path):
     settings = load_runtime_settings(write_config(tmp_path, provider="codex"))
 
     assert settings.codex_chat_model == "gpt-5.6-terra"
-    assert settings.codex_structured_model == "gpt-5.6-luna"
+    assert settings.codex_structured_model == "gpt-5.6-terra"
 
 
 def test_codex_models_are_configurable_and_validated(tmp_path):

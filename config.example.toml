@@ -102,7 +102,7 @@ voice = { status = [], notice = ["{text}"], command = ["{text}"], error = ["{tex
 [telegram]
 allowed_user_id = 123456789
 
-# Model backend. "codex" (default) runs gpt-5.6-luna over a Codex/ChatGPT
+# Model backend. "codex" (default) runs gpt-5.6-terra over a Codex/ChatGPT
 # subscription and needs `lenkobot login` once. "xai" keeps the legacy grok-4.5
 # OAuth path and is currently the only backend that supports [web_search].
 [provider]

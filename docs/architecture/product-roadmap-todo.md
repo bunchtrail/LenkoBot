@@ -667,7 +667,7 @@ Roadmap: [Open research gates](product-roadmap.md#open-research-gates)
 
 - [x] Выбрать провайдер model inference и подтвердить его контракт.
   Evidence: [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md) —
-  `gpt-5.6-luna` через официальный SDK `openai-codex` `0.144.4` на подписочном
+  `gpt-5.6-terra` через официальный SDK `openai-codex` `0.144.4` на подписочном
   OAuth; device-code логин, `output_schema`, `stream()` и типизированные ошибки
   подтверждены по официальному api-reference.
 - [ ] Выбрать web search source без новых постоянных расходов.
@@ -687,7 +687,7 @@ Roadmap: [Open research gates](product-roadmap.md#open-research-gates)
 - [ ] Добавить regression/acceptance test, если решение задаёт observable
   contract.
 
-## Провайдер model inference (Codex / gpt-5.6-luna)
+## Провайдер model inference (Codex / gpt-5.6-terra)
 
 Roadmap: подтверждённая целевая граница, строка `AI`.
 Research: [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md)
@@ -705,7 +705,8 @@ Research: [codex-oauth-2026-07.md](../analysis/codex-oauth-2026-07.md)
 - [x] Добавить startup preflight, который падает закрыто без входа в аккаунт.
 - [x] Сделать выбор бэкенда конфигурируемым (`[provider] name`), сохранив xAI.
 - [x] Fail-closed при `[web_search]` на бэкенде без поддержки инструментов.
-- [ ] Живой inference-smoke `gpt-5.6-luna` через LenkoBot.
+- [x] Живой inference-smoke через LenkoBot: `gpt-5.6-terra` отвечает в
+  пайплайне на VPS; структурные схемы памяти и summary разбираются.
   - Blocker: требуется однократный `lenkobot login` в изолированный
     `CODEX_HOME`; токен оператора намеренно не копировался.
 - [ ] Перенести web search на нативные инструменты Codex.

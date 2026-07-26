@@ -44,7 +44,7 @@ These patterns are useful independently of the default persona or model.
   `/quiet`, `/remember`, `/memories`, and `/forget`.
 - Editable status-to-final responses, safe message splitting, pagination, and
   replay-resistant confirmation callbacks.
-- `gpt-5.6-luna` over a Codex/ChatGPT subscription, with headless device-code
+- `gpt-5.6-terra` over a Codex/ChatGPT subscription, with headless device-code
   sign-in, an isolated `CODEX_HOME`, and every turn pinned to a read-only,
   approval-denying ephemeral thread. The legacy OAuth-only xAI `grok-4.5` path
   stays available behind `[provider] name = "xai"`.
