@@ -28,6 +28,7 @@ from .linux_oauth_credentials import (
     linux_credential_path,
 )
 from .codex_provider import (
+    CODEX_CHAT_MODEL,
     CODEX_MODEL,
     CodexProvider,
     CodexStructuredProvider,
@@ -106,6 +107,8 @@ class RuntimeSettings:
     export_recipient: str | None = None
     config_path: Path | None = None
     model_provider: str = "codex"
+    codex_chat_model: str = CODEX_CHAT_MODEL
+    codex_structured_model: str = CODEX_MODEL
 
 
 class _DiscardingReplyPort:
@@ -187,6 +190,14 @@ def load_runtime_settings(
     model_provider = provider_table.get("name", "codex")
     if model_provider not in ("codex", "xai"):
         raise ValueError("provider name must be 'codex' or 'xai'")
+    codex_chat_model = provider_table.get("chat_model", CODEX_CHAT_MODEL)
+    codex_structured_model = provider_table.get("structured_model", CODEX_MODEL)
+    for label, value in (
+        ("chat_model", codex_chat_model),
+        ("structured_model", codex_structured_model),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"provider {label} must be a non-empty string")
 
     try:
         persona_catalog = PersonaCatalog.from_toml(path)
@@ -203,6 +214,8 @@ def load_runtime_settings(
         export_recipient=export_recipient,
         config_path=path,
         model_provider=model_provider,
+        codex_chat_model=codex_chat_model,
+        codex_structured_model=codex_structured_model,
     )
 
 
@@ -313,10 +326,15 @@ def _build_providers(settings: RuntimeSettings):
     """Compose the inference providers for the configured model backend."""
     if settings.model_provider == "codex":
         verify_codex_credentials()
-        runner = SdkCodexThreadRunner()
         return (
-            CodexProvider(runner, model=CODEX_MODEL),
-            CodexStructuredProvider(runner, model=CODEX_MODEL),
+            CodexProvider(
+                SdkCodexThreadRunner(model=settings.codex_chat_model),
+                model=settings.codex_chat_model,
+            ),
+            CodexStructuredProvider(
+                SdkCodexThreadRunner(model=settings.codex_structured_model),
+                model=settings.codex_structured_model,
+            ),
         )
     store, lock = open_oauth_credentials()
     if store.load() is None:

@@ -999,3 +999,46 @@ def test_login_uses_codex_device_code_flow(tmp_path, monkeypatch):
 
     assert observed["called"] is True
     assert output == ["Open: https://example.test/activate"]
+
+
+def test_codex_models_default_to_terra_chat_and_luna_structured(tmp_path):
+    settings = load_runtime_settings(write_config(tmp_path, provider="codex"))
+
+    assert settings.codex_chat_model == "gpt-5.6-terra"
+    assert settings.codex_structured_model == "gpt-5.6-luna"
+
+
+def test_codex_models_are_configurable_and_validated(tmp_path):
+    config_path = write_config(tmp_path, provider="codex")
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write('chat_model = "gpt-5.6-sol"\nstructured_model = "gpt-5.6-terra"\n')
+
+    settings = load_runtime_settings(config_path)
+
+    assert settings.codex_chat_model == "gpt-5.6-sol"
+    assert settings.codex_structured_model == "gpt-5.6-terra"
+
+    broken = write_config(tmp_path / "broken", provider="codex")
+    with broken.open("a", encoding="utf-8") as config_file:
+        config_file.write('chat_model = "  "\n')
+
+    with pytest.raises(ValueError, match="chat_model"):
+        load_runtime_settings(broken)
+
+
+def test_open_local_application_wires_selected_codex_models(tmp_path, monkeypatch):
+    import lenkobot.runtime as runtime
+
+    monkeypatch.setattr(
+        runtime,
+        "open_oauth_credentials",
+        lambda **_: (_ for _ in ()).throw(AssertionError("codex path only")),
+    )
+
+    application = open_local_application(
+        load_runtime_settings(write_config(tmp_path, provider="codex"))
+    )
+    try:
+        assert application.service._provider._model == "gpt-5.6-terra"
+    finally:
+        application.close()
