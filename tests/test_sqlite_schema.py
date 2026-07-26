@@ -369,3 +369,47 @@ def test_failed_migration_rolls_back_ddl_and_does_not_advance_version(tmp_path):
     assert "memory" in tables
     assert "persona" not in tables
     assert "relationship" not in tables
+
+
+def test_security_audit_migration_preserves_legacy_events_and_adds_network_fields(tmp_path):
+    database_path = tmp_path / "state.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE security_audit (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL,
+            event_type TEXT NOT NULL CHECK(event_type IN ('reset_completed')),
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO security_audit (
+            id, owner_user_id, lifecycle_epoch, event_type, created_at
+        ) VALUES (7, 42, 2, 'reset_completed', '2026-07-23T11:00:00+00:00');
+        PRAGMA user_version = 9;
+        """
+    )
+    connection.close()
+
+    migrated = open_state_database(database_path)
+    columns = {
+        row[1]
+        for row in migrated.execute("PRAGMA table_info(security_audit)").fetchall()
+    }
+    legacy = migrated.execute(
+        """
+        SELECT owner_user_id, lifecycle_epoch, event_type, capability, outcome
+        FROM security_audit WHERE id = 7
+        """
+    ).fetchone()
+
+    assert {
+        "action_hash",
+        "capability",
+        "policy_decision",
+        "started_at",
+        "finished_at",
+        "outcome",
+    } <= columns
+    assert tuple(legacy) == (42, 2, "reset_completed", "reset", "completed")
+    migrated.close()

@@ -334,6 +334,69 @@ def _create_phase_two_lifecycle_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_security_audit_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_audit (
+            id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            lifecycle_epoch INTEGER NOT NULL CHECK(lifecycle_epoch > 0),
+            event_type TEXT NOT NULL CHECK(
+                event_type IN ('reset_completed', 'network_request')
+            ),
+            action_hash TEXT CHECK(
+                action_hash IS NULL OR length(action_hash) = 64
+            ),
+            capability TEXT NOT NULL DEFAULT 'reset'
+                CHECK(length(trim(capability)) > 0 AND length(capability) <= 100),
+            policy_decision TEXT NOT NULL DEFAULT 'allow'
+                CHECK(policy_decision IN ('allow', 'deny')),
+            outcome TEXT NOT NULL DEFAULT 'completed'
+                CHECK(outcome IN ('completed', 'success', 'blocked', 'failed')),
+            started_at TEXT NOT NULL DEFAULT '',
+            finished_at TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS security_audit_owner_created_idx
+            ON security_audit(owner_user_id, created_at DESC, id DESC)
+        """
+    )
+
+
+def _upgrade_security_audit_schema(connection: sqlite3.Connection) -> None:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "security_audit" not in tables:
+        _create_security_audit_schema(connection)
+        return
+    if "capability" in _column_names(connection, "security_audit"):
+        return
+    connection.execute("ALTER TABLE security_audit RENAME TO security_audit_legacy")
+    _create_security_audit_schema(connection)
+    connection.execute(
+        """
+        INSERT INTO security_audit (
+            id, owner_user_id, lifecycle_epoch, event_type, action_hash,
+            capability, policy_decision, outcome, started_at, finished_at,
+            created_at
+        )
+        SELECT id, owner_user_id, lifecycle_epoch, event_type, NULL,
+               'reset', 'allow', 'completed', created_at, created_at,
+               created_at
+        FROM security_audit_legacy
+        """
+    )
+    connection.execute("DROP TABLE security_audit_legacy")
+
+
 def _create_persona_version_schema(connection: sqlite3.Connection) -> None:
     tables = {
         str(row["name"])
@@ -683,6 +746,7 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_action_confirmation_schema,
     _create_reminder_schema,
     _add_reminder_snooze_dedup_schema,
+    _upgrade_security_audit_schema,
 )
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
 
