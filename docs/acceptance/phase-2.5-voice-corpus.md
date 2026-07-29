@@ -337,3 +337,18 @@ Identity 13 проверяет гипотезу о конфликтующей с
 - Finding: результат подтверждает overload-гипотезу; следующий refinement
   должен сжать negative rules вместо добавления новых.
 - Owner approval: `pending`
+
+### Run 10 (29 июля 2026, identity v14: compact positive contract)
+
+Identity 14 проверяет вторую owner-гипотезу: длинная стена запретов заставляет
+модель либо уходить в нейтральность, либо игнорировать края после позитивного
+мета-приоритета. Prompt сокращён на 56%; дубли объединены, examples уменьшены,
+а safety/accuracy/anti-toxicity границы сохранены отдельно.
+
+Acceptance corpus повторяет Crysis flow и дополнительно проверяет stop signal с
+последующим нейтральным достижением.
+
+- Prompt chars: `4 991` (version 13: `11 364`)
+- Prompt-contract tests: passed
+- Live isolated provider probe: `pending`
+- Owner approval: `pending`
