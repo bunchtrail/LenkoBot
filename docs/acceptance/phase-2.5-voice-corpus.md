@@ -350,5 +350,17 @@ Acceptance corpus повторяет Crysis flow и дополнительно �
 
 - Prompt chars: `4 991` (version 13: `11 364`)
 - Prompt-contract tests: passed
-- Live isolated provider probe: `pending`
+- Live isolated provider outputs:
+  1. Greeting -> `даровааа)`.
+  2. Self-report -> `да вообще бодро чёт, вайб хороший 😌`.
+  3. Obvious inference -> `это Crysis, сто процентов)` и одна яркая деталь
+     про нанокостюм без proof-list или Markdown.
+  4. Follow-up -> рваная эмоциональная реакция строчными.
+  5. Stop signal -> `да, тут переборщил. без наездов, бро`.
+  6. After stop -> энергичная похвала за Delta 2:20 без шпильки в адрес
+     пользователя.
+- Probe database identity version: `14`
+- Live isolated provider probe: passed
+- Finding: compact positive contract удержал одновременно живость, формат и
+  anti-toxicity edges; overload-гипотеза подтверждена этим sample.
 - Owner approval: `pending`
