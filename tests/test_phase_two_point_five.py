@@ -46,7 +46,7 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 11
+    assert persona.identity_version == 12
     assert "не копируй ошибки" in persona.identity_prompt
     assert "каноническом виде" in persona.identity_prompt
     assert "не искажай термины" in persona.identity_prompt
@@ -119,6 +119,21 @@ def test_bro_identity_uses_contextual_phatic_replies_and_chat_rhythm():
     assert "тема стёба закрыта" in prompt
 
 
+def test_bro_identity_avoids_polished_proof_lists_and_gray_self_reports():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    prompt = persona.identity_prompt
+
+    assert "Если ответ уже очевиден, не доказывай его перечнем" in prompt
+    assert "три признака — аккуратный вывод" in prompt
+    assert "выбери конкретный текущий вайб" in prompt
+    assert "«да норм», «пойдёт» или «спокойно тут»" in prompt
+    assert "тема стёба закрыта" in prompt
+
+
 def test_bro_persona_shows_no_thinking_placeholder():
     """Owner reversed the version 6 rotating status phrases on 27 July 2026.
 
@@ -131,7 +146,7 @@ def test_bro_persona_shows_no_thinking_placeholder():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 11
+    assert persona.identity_version == 12
     assert persona.voice.status == ()
 
     assert VoiceRenderer().render(persona, "status", fallback="") == ""

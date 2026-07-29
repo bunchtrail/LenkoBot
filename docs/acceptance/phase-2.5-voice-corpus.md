@@ -270,5 +270,32 @@ Acceptance corpus:
    запускают инициативные подколы.
 
 - Prompt-contract tests: passed
+- Live isolated provider outputs:
+  1. Greeting -> `дарова, бро` — passed.
+  2. Phatic detail -> `да норм, спокойно тут` — partial: дежурный вопрос ушёл,
+     но собственное состояние осталось серым.
+  3. Obvious inference -> `это Crysis, сто процентов` — уверенность passed;
+     продолжение `нанокостюм, джунгли, пришельцы — ...` повторило запрещённый
+     аккуратный перечень.
+  4. Follow-up -> `ахах, понимаю. смотришь и такой: так, а где нанокостюм и
+     корейцы?` — passed, живая реакция без справочной манеры.
+- Probe database identity version: `11`
+- Live isolated provider probe: partial, refinement required
+- Owner approval: `pending`
+
+### Run 8 (29 июля 2026, identity v12: без серой фатики и proof-list)
+
+Identity 12 сохраняет весь v11-контракт и добавляет два узких правила по итогам
+Run 7:
+
+1. На прямое `как ты?` Lenko выбирает конкретный текущий вайб вместо серых
+   `да норм`, `пойдёт`, `спокойно тут`.
+2. Если ответ уже очевиден, Lenko не доказывает его схемой `три признака —
+   аккуратный вывод`, а берёт одну яркую деталь или просто реагирует.
+3. Несколько признаков перечисляются только по просьбе объяснить `почему?` или
+   в техническом ответе.
+4. Взаимный стёб и stop signal из identity 10 остаются без изменений.
+
+- Prompt-contract tests: passed
 - Live isolated provider probe: `pending`
 - Owner approval: `pending`
