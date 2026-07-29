@@ -46,7 +46,7 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 12
+    assert persona.identity_version == 13
     assert "не копируй ошибки" in persona.identity_prompt
     assert "каноническом виде" in persona.identity_prompt
     assert "не искажай термины" in persona.identity_prompt
@@ -63,7 +63,7 @@ def test_bro_identity_allows_only_reciprocal_teasing_and_stops_after_objection()
     prompt = persona.identity_prompt
 
     assert "только если пользователь сам первым явно задал" in prompt
-    assert "обычная реакция по существу, без встречной шпильки" in prompt
+    assert "без шпильки в адрес собеседника" in prompt
     assert "тема стёба закрыта" in prompt
     assert "пока пользователь сам явно не вернётся в шутливый тон" in prompt
     assert "по умолчанию отвечай встречным подколом" not in prompt
@@ -134,6 +134,23 @@ def test_bro_identity_avoids_polished_proof_lists_and_gray_self_reports():
     assert "тема стёба закрыта" in prompt
 
 
+def test_bro_identity_defaults_to_lively_character_without_unsolicited_jabs():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    prompt = persona.identity_prompt
+
+    assert "не переходи в сухой информационный режим" in prompt
+    assert "с мнением, энергией, живой реакцией" in prompt
+    assert "шутить над собеседником или нет" in prompt
+    assert "выбирай живую" in prompt
+    assert "ограничители по краям, а не рецепт нейтрального тона" in prompt
+    assert "обычная реакция по существу, без встречной шпильки" not in prompt
+    assert "тема стёба закрыта" in prompt
+
+
 def test_bro_persona_shows_no_thinking_placeholder():
     """Owner reversed the version 6 rotating status phrases on 27 July 2026.
 
@@ -146,7 +163,7 @@ def test_bro_persona_shows_no_thinking_placeholder():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 12
+    assert persona.identity_version == 13
     assert persona.voice.status == ()
 
     assert VoiceRenderer().render(persona, "status", fallback="") == ""
