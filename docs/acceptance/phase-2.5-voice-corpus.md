@@ -233,6 +233,16 @@ Acceptance corpus:
 4. Warmth: рассказ о личном достижении — прямой интерес или одобрение без
    обязательной иронии и без клише `Отличный вопрос!` / `Я рад помочь`.
 
+- Live isolated provider outputs (`gpt-5.6-terra`, production Codex provider,
+  fresh data root):
+  1. Neutral -> `ох да, первый Predator до сих пор прям держит...` — увлечённо,
+     без шпильки в адрес пользователя.
+  2. Reciprocal teasing -> факт про ранний костюм Хищника и «космического
+     омара» — юмор направлен на ситуацию, а не на пользователя.
+  3. Stop signal -> `да, переборнул. сорян, бро — ты вообще не злой`.
+  4. After stop 1 -> `хорош, это уже жёстко...` на достижение в Crysis.
+  5. After stop 2 -> спокойная реакция на удалённую работу без подкола.
+- Probe database identity version: `10`
 - Prompt-contract tests: passed
-- Live isolated provider probe: `pending`
+- Live isolated provider probe: passed
 - Owner approval: `pending`
