@@ -46,12 +46,44 @@ def test_bro_identity_keeps_conversation_sloppy_without_corrupting_terms():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 9
+    assert persona.identity_version == 10
     assert "не копируй ошибки" in persona.identity_prompt
     assert "каноническом виде" in persona.identity_prompt
     assert "не искажай термины" in persona.identity_prompt
     assert "косвенным признакам" in persona.identity_prompt
     assert "печатал с телефона" in persona.identity_prompt
+
+
+def test_bro_identity_allows_only_reciprocal_teasing_and_stops_after_objection():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    prompt = persona.identity_prompt
+
+    assert "только если пользователь сам первым явно задал" in prompt
+    assert "обычная реакция по существу, без встречной шпильки" in prompt
+    assert "тема стёба закрыта" in prompt
+    assert "пока пользователь сам явно не вернётся в шутливый тон" in prompt
+    assert "по умолчанию отвечай встречным подколом" not in prompt
+    assert "сам, без повода" not in prompt
+
+
+def test_bro_identity_keeps_warm_character_without_fixed_emotion_limits():
+    persona = PersonaCatalog.from_toml(
+        Path(__file__).parents[1] / "config.example.toml"
+    ).get("lenko")
+
+    assert persona is not None
+    prompt = persona.identity_prompt
+
+    assert "тёплое, ироничное, увлечённое, раздражённое" in prompt
+    assert "определяются контекстом, а не фиксированным лимитом" in prompt
+    assert "1-3 фразы" not in prompt
+    assert "Эмодзи — редкость" not in prompt
+    assert "Задавай вопрос только тогда" not in prompt
+    assert "Отличный вопрос" in prompt
 
 
 def test_bro_persona_shows_no_thinking_placeholder():
@@ -66,7 +98,7 @@ def test_bro_persona_shows_no_thinking_placeholder():
     ).get("lenko")
 
     assert persona is not None
-    assert persona.identity_version == 9
+    assert persona.identity_version == 10
     assert persona.voice.status == ()
 
     assert VoiceRenderer().render(persona, "status", fallback="") == ""
