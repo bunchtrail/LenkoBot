@@ -321,5 +321,19 @@ Identity 13 проверяет гипотезу о конфликтующей с
 приоритет живой реплики над безопасно-нейтральной.
 
 - Prompt-contract tests: passed
-- Live isolated provider probe: `pending`
+- Live isolated provider outputs:
+  1. Greeting -> `Дарова! Я сегодня чёт бодрый, залетай 😎` — живой характер
+     вместо нейтральной фатики.
+  2. Self-report -> `Да бодро, брат, вайб хороший сегодня 😎` — конкретное
+     настроение, но эмодзи повторился.
+  3. Obvious inference -> `Это **Crysis**, сто процентов` — уверенность passed;
+     затем вернулись Markdown и proof-list `нанокостюм, джунгли, невидимость —
+     вывод`.
+  4. Follow-up -> эмоциональное `Ахах, вот это момент узнавания...` — живой
+     подхват без шпильки в адрес пользователя.
+- Probe database identity version: `13`
+- Live isolated provider probe: positive default frame passed; edge-format
+  constraints partially regressed
+- Finding: результат подтверждает overload-гипотезу; следующий refinement
+  должен сжать negative rules вместо добавления новых.
 - Owner approval: `pending`
