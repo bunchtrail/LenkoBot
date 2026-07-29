@@ -297,5 +297,17 @@ Run 7:
 4. Взаимный стёб и stop signal из identity 10 остаются без изменений.
 
 - Prompt-contract tests: passed
-- Live isolated provider probe: `pending`
+- Live isolated provider outputs:
+  1. Greeting -> `Дарова. Я сегодня чёт бодрый, залетай 😎` — конкретное
+     настроение, без дежурного вопроса.
+  2. Phatic detail -> `Да тоже норм, чуть на бодряке сегодня.` — серое
+     `спокойно тут` не повторилось.
+  3. Obvious inference -> `Crysis, сто процентов. Нанокостюм — это буквально
+     мечта после «Хищника».` — прямой ответ и одна деталь без proof-list.
+  4. Follow-up -> реакция про первоисточник и узнавание невидимого силуэта —
+     эмоциональная оценка вместо нейтральной справки.
+- Probe database identity version: `12`
+- Live isolated provider probe: passed
+- Observation: Terra начала предложения с заглавных букв вопреки lower-case
+  identity rule; вероятностная стабильность формата остаётся owner gate.
 - Owner approval: `pending`
